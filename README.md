@@ -16,7 +16,7 @@ Built with Playwright (headless Edge) for reliable scraping that doesn't get blo
 
 | Tool | Description |
 |---|---|
-| `amazon_search` | Search Amazon. Returns up to 15 results with title, price, rating, review count, Prime badge, ASIN, and product URL |
+| `amazon_search` | Search Amazon. Returns up to 20 results with title, price, rating, review count, Prime badge, ASIN, and product URL |
 | `amazon_product_details` | Scrape one or more product pages in parallel. Returns specs, features, description, colors, sizes, brand, price, images, availability |
 | `amazon_product_reviews` | Get reviews from a product page. Returns star distribution, overall rating, total review count, and individual reviews |
 
@@ -77,7 +77,7 @@ Claude will:
 1. **Search** Amazon for webcams
 2. **Scrape details** for the top candidates (in parallel)
 3. **Read reviews** for the finalists
-4. **Compare** everything and give you a top 3 with reasoning
+4. **Compare** everything and give you a top 3 with reasoning and direct links
 
 You can also be more specific:
 
@@ -92,7 +92,7 @@ You can also be more specific:
 **`amazon_search`**
 - `query` — search terms (e.g. "wireless earbuds under $50")
 - `domain` — Amazon domain suffix: `"ca"` (default), `"com"`, `"co.uk"`, etc.
-- `max_results` — number of results to return (default: 15)
+- `max_results` — number of results to return (default: 20)
 
 **`amazon_product_details`**
 - `urls` — list of Amazon product page URLs (scraped in parallel, up to 8 concurrent)

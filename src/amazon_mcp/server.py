@@ -68,7 +68,7 @@ mcp = FastMCP("amazon-shopping")
 
 @mcp.tool()
 async def amazon_search(
-    query: str, domain: str = "ca", max_results: int = 15
+    query: str, domain: str = "ca", max_results: int = 20
 ) -> str:
     """Search Amazon for products.
 
@@ -78,7 +78,7 @@ async def amazon_search(
     Args:
         query: Search terms, e.g. "wireless noise cancelling headphones"
         domain: Amazon domain — "ca" for Canada, "com" for US (default: ca)
-        max_results: Maximum number of results to return (default: 15)
+        max_results: Maximum number of results to return (default: 20)
     """
     page = await create_page(block_media=True)
     try:
