@@ -1,0 +1,16 @@
+[project]
+name = "amazon-mcp"
+version = "0.1.0"
+description = "Amazon product search, comparison, and review analysis MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.6.0",
+    "playwright>=1.40.0",
+]
+
+[project.scripts]
+amazon-mcp = "amazon_mcp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
