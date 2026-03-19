@@ -26,7 +26,6 @@ Built with Playwright (headless Edge) for reliable scraping that doesn't get blo
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- Microsoft Edge browser installed
 
 ### Install
 
@@ -36,16 +35,24 @@ cd amazon-shopping-mcp
 uv sync
 ```
 
-Install the Playwright browser (skip if Edge is already installed):
+Install a browser for Playwright:
 
 ```bash
-.venv/bin/playwright install msedge
+# Use bundled Chromium (works everywhere, recommended)
+.venv/bin/playwright install chromium
+
+# Or use an existing browser by setting BROWSER_CHANNEL:
+# "chrome", "msedge", etc. — no Playwright install needed
 ```
 
 ### Add to Claude Code
 
 ```bash
+# Using bundled Chromium (default)
 claude mcp add --scope user amazon-shopping -- /path/to/amazon-shopping-mcp/.venv/bin/python -m amazon_mcp
+
+# Or to use a specific browser (e.g. Edge, Chrome):
+claude mcp add --scope user -e BROWSER_CHANNEL=msedge amazon-shopping -- /path/to/amazon-shopping-mcp/.venv/bin/python -m amazon_mcp
 ```
 
 Replace `/path/to/amazon-shopping-mcp` with the actual path where you cloned the repo.
@@ -103,7 +110,7 @@ You can also be more specific:
 
 ## How It Works
 
-Uses Playwright with headless Microsoft Edge to load actual Amazon pages, then extracts data from the DOM using JavaScript evaluation. This approach is more reliable than API-based scrapers because:
+Uses Playwright with a headless browser to load actual Amazon pages, then extracts data from the DOM using JavaScript evaluation. This approach is more reliable than API-based scrapers because:
 
 - Renders the full page like a real browser
 - Handles dynamic content loaded via JavaScript

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 from urllib.parse import quote_plus
 
@@ -20,8 +21,9 @@ async def get_browser() -> Browser:
     global _browser, _pw
     if _browser is None or not _browser.is_connected():
         _pw = await async_playwright().start()
+        channel = os.environ.get("BROWSER_CHANNEL")  # e.g. "msedge", "chrome"
         _browser = await _pw.chromium.launch(
-            channel="msedge",
+            **({"channel": channel} if channel else {}),
             headless=True,
         )
     return _browser
