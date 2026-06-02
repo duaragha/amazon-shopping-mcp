@@ -99,10 +99,26 @@ async def get_logged_in_context(headless: bool | None = None) -> BrowserContext:
         "user_agent": _USER_AGENT,
         "viewport": {"width": 1920, "height": 1080},
         "locale": "en-CA",
+        # Anti-bot: drop the most obvious headless/automation tells. Pairs with the
+        # init script below. The real-profile cookies do most of the trust-building;
+        # this stops Amazon's fingerprinter from flagging the automation flags.
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ],
     }
     if channel:
         kwargs["channel"] = channel
     _ctx = await _ctx_pw.chromium.launch_persistent_context(USER_DATA_DIR, **kwargs)
+    # Mask the leftover webdriver/automation signals before any page script runs.
+    await _ctx.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-CA', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = window.chrome || { runtime: {} };
+        """
+    )
     # No logged-in flow needs images/fonts/video — drop them for speed.
     await _ctx.route(_MEDIA_RE, lambda route: route.abort())
     return _ctx
@@ -159,12 +175,59 @@ async def _dismiss_popups(page: Page) -> None:
             pass
 
 
+async def _add_via_buying_options(page: Page) -> str | None:
+    """For items with no featured buy box: open "See all buying options" and add
+    the first offer to the cart. Returns a label on success, None on failure.
+    """
+    opened = False
+    for sel in (
+        "#buybox-see-all-buying-choices a",
+        "#buybox-see-all-buying-choices-announce",
+        'a[title*="See All Buying Options"]',
+        "#buybox-see-all-buying-choices",
+    ):
+        el = await page.query_selector(sel)
+        if el:
+            await el.click()
+            opened = True
+            break
+    if not opened:
+        return None
+    # Wait for the All-Offers-Display panel, then add the first offer.
+    try:
+        await page.wait_for_selector(
+            "#aod-offer, #all-offers-display, #aod-offer-list", timeout=8000
+        )
+    except Exception:
+        return None
+    await page.wait_for_timeout(800)
+    for sel in (
+        '#aod-offer input[name="submit.addToCart"]',
+        "#aod-offer .a-button-input",
+        '#aod-offer-list input[name="submit.addToCart"]',
+        'input[name="submit.addToCart"]',
+    ):
+        btn = await page.query_selector(sel)
+        if btn:
+            await btn.click()
+            return "buying-options offer"
+    return None
+
+
 async def check_captcha(page: Page) -> str | None:
-    title = await page.title()
-    if any(w in title.lower() for w in ("robot", "captcha", "sorry", "bot")):
+    # Detect the bot wall by its actual form/input — NOT by fuzzy title words.
+    # (Substring matching falsely flagged product titles like "...Syrup Bottle"
+    # because "Bottle" contains "bot".)
+    if await page.query_selector(
+        'form[action*="validateCaptcha"], input#captchacharacters'
+    ):
         return (
-            "Amazon is showing a CAPTCHA / bot-check page. "
-            "Try again in a moment."
+            "Amazon is showing a CAPTCHA / bot-check page. Try again in a moment."
+        )
+    title = (await page.title()).lower()
+    if title.startswith("robot check") or title.startswith("sorry! something went wrong"):
+        return (
+            "Amazon is showing a CAPTCHA / bot-check page. Try again in a moment."
         )
     return None
 
@@ -887,13 +950,24 @@ async def amazon_add_to_cart(
                 pass  # some listings have no quantity selector
 
         atc = await page.query_selector("#add-to-cart-button")
-        if not atc:
-            avail = await page.query_selector("#availability")
-            msg = (await avail.inner_text()).strip() if avail else "unknown"
-            return json.dumps(
-                {"error": "No add-to-cart button found.", "availability": msg, "url": url}
-            )
-        await atc.click()
+        offer_used = None
+        if atc:
+            await atc.click()
+        else:
+            # No featured buy box — the item sells via "See all buying options".
+            # Open the offers panel and add the first (top / cheapest-shown) offer.
+            offer_used = await _add_via_buying_options(page)
+            if not offer_used:
+                avail = await page.query_selector("#availability")
+                msg = (await avail.inner_text()).strip() if avail else "unknown"
+                return json.dumps(
+                    {
+                        "error": "No add-to-cart button and no buyable offer found "
+                        "(item may be unavailable or seller-restricted).",
+                        "availability": msg,
+                        "url": url,
+                    }
+                )
         await page.wait_for_timeout(1500)
         await _dismiss_popups(page)
 
@@ -904,6 +978,7 @@ async def amazon_add_to_cart(
                 "added": True,
                 "title": title_text,
                 "quantity": quantity,
+                "via": offer_used or "buy box",
                 "cart_count": cart_count,
                 "url": url,
             }
@@ -1566,6 +1641,155 @@ async def amazon_start_return(
         )
     except Exception as e:
         return json.dumps({"error": str(e)})
+    finally:
+        await page.close()
+
+
+@mcp.tool()
+async def amazon_subscribe(
+    asin: str | None = None,
+    url: str | None = None,
+    frequency: str | None = None,
+    confirm: bool = False,
+    domain: str = DEFAULT_DOMAIN,
+) -> str:
+    """Subscribe to a product via Amazon Subscribe & Save (recurring delivery).
+
+    SAFETY — this sets up a RECURRING charge. With confirm=False (default) it only
+    PREVIEWS: expands the Subscribe & Save option and returns the S&S price, the
+    discount, and the delivery frequency WITHOUT subscribing. confirm=true is
+    required to actually create the subscription.
+
+    NOTE: the submit path is best-effort and NOT verified end-to-end (verifying
+    would mean creating a real recurring subscription on the account). Treat
+    confirm=true as live-untested until a real subscription is intentionally made.
+
+    Args:
+        asin: 10-char product ASIN. Either this or url.
+        url: full product page URL. Either this or asin.
+        frequency: desired delivery cadence to match, e.g. "1 month", "2 months".
+            If omitted, Amazon's default cadence is used.
+        confirm: must be true to actually subscribe. Default false = preview only.
+        domain: Amazon domain — "ca" for Canada, "com" for US.
+    """
+    if not asin and not url:
+        return json.dumps({"error": "Provide either an asin or a url."})
+    if not url:
+        url = f"https://www.amazon.{domain}/dp/{asin}"
+
+    ctx = await get_logged_in_context()
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        captcha = await check_captcha(page)
+        if captcha:
+            return json.dumps({"error": captcha})
+        name = await _account_name(page)
+        if not _is_logged_in(name):
+            return json.dumps({"error": "Not logged in. Run amazon_login first."})
+
+        title_el = await page.query_selector("#productTitle")
+        title = (await title_el.inner_text()).strip() if title_el else None
+
+        # Expand the "Subscribe & Save" accordion so its controls render.
+        await page.evaluate(
+            """
+            () => {
+                const rows = [...document.querySelectorAll(
+                    '.a-accordion-row, [id*="ccordionRow"], .a-box'
+                )];
+                for (const r of rows) {
+                    if (/subscribe & save|subscribe and save/i.test(r.textContent || '')) {
+                        (r.querySelector('a, input[type=radio], [role=button]') || r).click();
+                        return;
+                    }
+                }
+            }
+            """
+        )
+        await page.wait_for_timeout(2000)
+
+        sub_btn = await page.query_selector("#rcx-subscribe-submit-button")
+        if not sub_btn:
+            return json.dumps(
+                {
+                    "error": "This item isn't offering Subscribe & Save right now "
+                    "(not S&S-eligible, or no active subscription offer).",
+                    "subscribable": False,
+                    "url": url,
+                }
+            )
+
+        # Best-effort frequency selection (Amazon's default is used if this misses).
+        freq_applied = "default"
+        if frequency:
+            try:
+                fl = frequency.lower()
+                sels = await page.query_selector_all("select")
+                for sel in sels:
+                    opts = await sel.query_selector_all("option")
+                    for o in opts:
+                        if fl in ((await o.inner_text()) or "").lower():
+                            await sel.select_option(value=await o.get_attribute("value"))
+                            freq_applied = frequency
+                            break
+                    if freq_applied != "default":
+                        break
+            except Exception:
+                freq_applied = "default (couldn't set requested frequency)"
+
+        preview = await page.evaluate(
+            """
+            () => {
+                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                // Discount % and cadence render in the text around the subscribe button.
+                const btn = document.querySelector('#rcx-subscribe-submit-button');
+                let scope = btn;
+                for (let i = 0; i < 6 && scope; i++) scope = scope.parentElement;
+                const txt = clean((scope || document).textContent);
+                const discount = (txt.match(/save (?:up to )?\\d+%|\\d+% off/i) || [])[0] || null;
+                const freq = (txt.match(/(?:deliver every|every)\\s*[\\w ]{0,18}(?:week|month)s?/i) || [])[0] || null;
+                // Base price from the main buy-box (S&S = base minus the discount).
+                const price = clean((document.querySelector(
+                    '#corePriceDisplay_desktop_feature_div .a-offscreen, #corePrice_feature_div .a-offscreen, .a-price .a-offscreen'
+                ) || {}).textContent) || null;
+                return { base_price: price, discount, frequency: freq };
+            }
+            """
+        )
+        preview["title"] = title
+        preview["frequency_requested"] = freq_applied
+
+        if not confirm:
+            preview["subscribed"] = False
+            preview["next_step"] = (
+                "Preview only — no subscription created. To actually subscribe "
+                "(recurring charge), call amazon_subscribe again with confirm=true."
+            )
+            return json.dumps(preview, indent=2)
+
+        await sub_btn.click()
+        await page.wait_for_timeout(2500)
+        ok = await page.evaluate(
+            """
+            () => /subscription|subscribed|you'll receive|first delivery|manage your subscriptions/i
+                .test(document.body.innerText || '')
+            """
+        )
+        return json.dumps(
+            {
+                "subscribed": bool(ok),
+                "title": title,
+                "frequency": preview.get("frequency"),
+                "base_price": preview.get("base_price"),
+                "message": "Subscription created."
+                if ok
+                else "Clicked subscribe but couldn't confirm — check Your Subscribe & Save Items.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "url": url})
     finally:
         await page.close()
 

@@ -34,6 +34,15 @@ Built with Playwright for reliable browsing that doesn't get blocked like simple
 | `amazon_add_to_cart` | Add a product (by ASIN or URL) to your cart, with optional quantity |
 | `amazon_view_cart` | View cart line items, quantities, and subtotal |
 | `amazon_place_order` | Walk through checkout. Default = **preview only** (returns ship-to / payment / total). Call again with `confirm=true` to actually place the order |
+| `amazon_subscribe` | Set up Subscribe & Save on a product. Default = **preview only** (base price / discount / cadence). `confirm=true` creates the **recurring** subscription |
+
+### Orders & returns (requires `amazon_login` first)
+
+| Tool | Description |
+|---|---|
+| `amazon_list_orders` | List recent orders — number, date, total, items, delivery status, and whether a return is currently offered |
+| `amazon_view_returns` | List in-progress / past returns with their status (from the returns-filtered order history) |
+| `amazon_start_return` | Open the return wizard for an order. Default = **preview only** (returnable items + reason options); `confirm=true` to submit |
 
 ## Setup
 
