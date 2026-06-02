@@ -1016,47 +1016,55 @@ async def amazon_view_cart(domain: str = DEFAULT_DOMAIN) -> str:
             () => {
                 // Scope strictly to the active-cart container so we don't pick up
                 // "Saved for later" rows or recommendation/"buy again" carousels.
+                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                // #activeCartViewForm reliably wraps ONLY the active line items
+                // (not "saved for later" or recommendation carousels).
                 const root =
-                    document.querySelector('#sc-active-cart') ||
                     document.querySelector('#activeCartViewForm') ||
+                    document.querySelector('#sc-active-cart') ||
                     document.querySelector('[data-name="Active Items"]');
                 const items = [];
                 if (root) {
-                    // Real cart line items carry a data-asin; carousels/ads don't.
-                    root.querySelectorAll('.sc-list-item[data-asin]').forEach(it => {
-                        const asin = it.getAttribute('data-asin');
-                        if (!asin) return;
-                        const title = it.querySelector(
+                    // Each line item is a .sc-list-item; its ASIN sits on the element
+                    // OR a descendant — don't require it on the element itself
+                    // (that was the bug that made this enumerate ~1 of N).
+                    root.querySelectorAll('.sc-list-item').forEach(it => {
+                        const title = clean(it.querySelector(
                             '.sc-product-title, .a-truncate-cut, .sc-grid-item-product-title, [data-feature-id="item-title"]'
-                        )?.textContent?.trim();
-                        const price = it.querySelector(
+                        )?.textContent);
+                        if (!title) return;
+                        const asin = it.getAttribute('data-asin')
+                            || it.querySelector('[data-asin]')?.getAttribute('data-asin')
+                            || null;
+                        const price = clean(it.querySelector(
                             '.sc-product-price, .sc-badge-price-to-pay, .a-price .a-offscreen'
-                        )?.textContent?.trim();
-                        const qtyEl = it.querySelector(
-                            '.sc-quantity-textfield, input.sc-update-quantity, .a-dropdown-prompt, [data-action="a-stepper"] input'
+                        )?.textContent) || null;
+                        // Quantity: a plain integer. Ignore the Subscribe & Save
+                        // frequency dropdown ("2 months (Most common)").
+                        const qtyRaw = clean(
+                            it.querySelector('.sc-quantity-textfield, input.sc-update-quantity, [data-action="a-stepper"] input')?.value
                         );
-                        const qty = qtyEl
-                            ? (qtyEl.value || qtyEl.textContent || '').trim()
-                            : null;
-                        if (title) items.push({ asin, title, price: price || null, quantity: qty });
+                        const qty = /^\\d+$/.test(qtyRaw) ? qtyRaw : '1';
+                        items.push({ asin, title, price, quantity: qty });
                     });
                 }
-                // Dedupe by asin (cart can render hidden duplicate nodes).
+                // Dedupe by asin when present, else by title.
                 const seen = new Set();
                 const deduped = items.filter(i => {
-                    if (seen.has(i.asin)) return false;
-                    seen.add(i.asin);
+                    const k = i.asin || i.title;
+                    if (seen.has(k)) return false;
+                    seen.add(k);
                     return true;
                 });
+                // Active-cart subtotal (NOT the buybox element, which can be stale).
                 const subtotal =
-                    document.querySelector('#sc-subtotal-amount-activecart .sc-price')?.textContent?.trim() ||
-                    document.querySelector('#sc-subtotal-amount-buybox .sc-price')?.textContent?.trim() ||
-                    document.querySelector('#sc-subtotal-amount-activecart')?.textContent?.trim() ||
-                    document.querySelector('#sc-subtotal-amount-buybox')?.textContent?.trim() ||
+                    clean(document.querySelector('#sc-subtotal-amount-activecart .sc-price')?.textContent) ||
+                    clean(document.querySelector('#sc-subtotal-amount-activecart')?.textContent) ||
+                    clean(document.querySelector('#sc-subtotal-amount-buybox .sc-price')?.textContent) ||
                     null;
                 const countText =
-                    document.querySelector('#sc-subtotal-label-activecart, #sc-subtotal-label-buybox')
-                        ?.textContent?.trim() || null;
+                    clean(document.querySelector('#sc-subtotal-label-activecart, #sc-subtotal-label-buybox')?.textContent)
+                    || null;
                 return { items: deduped, subtotal, countText };
             }
             """
