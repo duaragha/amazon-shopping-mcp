@@ -1,7 +1,7 @@
 [project]
 name = "amazon-mcp"
 version = "0.1.0"
-description = "Amazon product search, comparison, and review analysis MCP server"
+description = "Amazon MCP server: search, compare, review, and buy products — cart, checkout, orders, and returns"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.6.0",
