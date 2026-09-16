@@ -14,134 +14,56 @@ import asyncio
 import json
 import os
 import re
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from mcp.server.fastmcp import FastMCP
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import Page
+
+from .browser import (
+    BROWSER_BACKEND,
+    HEADLESS,
+    USER_DATA_DIR,
+    close_logged_in_context,
+    create_page,
+    get_browser,
+    get_browser_backend,
+    get_logged_in_context,
+)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-# Where the logged-in Chromium profile (cookies/session) lives on disk.
-USER_DATA_DIR = os.environ.get(
-    "AMAZON_USER_DATA_DIR", os.path.expanduser("~/.amazon-mcp/user-data")
-)
 # Default storefront for account/cart/checkout flows.
 DEFAULT_DOMAIN = os.environ.get("AMAZON_DOMAIN", "ca")
-# Run the logged-in context headless. Login itself is always headful.
-HEADLESS = os.environ.get("AMAZON_HEADLESS", "1") != "0"
-
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-)
-_MEDIA_RE = re.compile(
-    r"\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|mp4|webm)(\?|$)", re.I
+# Downloaded order documents contain names, addresses, and purchase details. Keep
+# them in the server's private state directory unless the operator opts into a
+# different location.
+INVOICE_DIR = os.environ.get(
+    "AMAZON_INVOICE_DIR", os.path.expanduser("~/.amazon-mcp/invoices")
 )
 
-# ---------------------------------------------------------------------------
-# Browser management
-# ---------------------------------------------------------------------------
-
-_browser: Browser | None = None
-_pw = None
-
-
-async def get_browser() -> Browser:
-    global _browser, _pw
-    if _browser is None or not _browser.is_connected():
-        _pw = await async_playwright().start()
-        channel = os.environ.get("BROWSER_CHANNEL")  # e.g. "msedge", "chrome"
-        _browser = await _pw.chromium.launch(
-            **({"channel": channel} if channel else {}),
-            headless=True,
-        )
-    return _browser
-
-
-async def create_page(block_media: bool = False) -> Page:
-    browser = await get_browser()
-    context = await browser.new_context(
-        user_agent=_USER_AGENT,
-        viewport={"width": 1920, "height": 1080},
-        locale="en-CA",
-    )
-    if block_media:
-        await context.route(_MEDIA_RE, lambda route: route.abort())
-    page = await context.new_page()
-    return page
-
-
-# ---------------------------------------------------------------------------
-# Persistent logged-in context (for account / cart / checkout)
-# ---------------------------------------------------------------------------
-
-_ctx: BrowserContext | None = None
-_ctx_pw = None
-
-
-async def get_logged_in_context(headless: bool | None = None) -> BrowserContext:
-    """Return the persistent, logged-in browser context (launching it if needed).
-
-    All pages share the same cookies/session, persisted under USER_DATA_DIR.
-    """
-    global _ctx, _ctx_pw
-    if _ctx is not None:
-        return _ctx
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-    if _ctx_pw is None:
-        _ctx_pw = await async_playwright().start()
-    channel = os.environ.get("BROWSER_CHANNEL")
-    kwargs = {
-        "headless": HEADLESS if headless is None else headless,
-        "user_agent": _USER_AGENT,
-        "viewport": {"width": 1920, "height": 1080},
-        "locale": "en-CA",
-        # Anti-bot: drop the most obvious headless/automation tells. Pairs with the
-        # init script below. The real-profile cookies do most of the trust-building;
-        # this stops Amazon's fingerprinter from flagging the automation flags.
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-    }
-    if channel:
-        kwargs["channel"] = channel
-    _ctx = await _ctx_pw.chromium.launch_persistent_context(USER_DATA_DIR, **kwargs)
-    # Mask the leftover webdriver/automation signals before any page script runs.
-    await _ctx.add_init_script(
-        """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-CA', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = window.chrome || { runtime: {} };
-        """
-    )
-    # No logged-in flow needs images/fonts/video — drop them for speed.
-    await _ctx.route(_MEDIA_RE, lambda route: route.abort())
-    return _ctx
-
-
-async def close_logged_in_context() -> None:
-    """Close the persistent context, flushing the session profile to disk.
-
-    The Chromium profile is locked while open, so login (which needs a second,
-    headful window on the same profile) must close it first; the next call to
-    get_logged_in_context() transparently reopens it.
-    """
-    global _ctx, _ctx_pw
-    if _ctx is not None:
-        try:
-            await _ctx.close()
-        finally:
-            _ctx = None
-    if _ctx_pw is not None:
-        try:
-            await _ctx_pw.stop()
-        finally:
-            _ctx_pw = None
+# Product images are the only blocked media needed in a printable order summary.
+# Allowing the much broader media pattern made Amazon's decorative assets slow
+# document export dramatically.
+_PRODUCT_IMAGE_RE = re.compile(r"^https://m\.media-amazon\.com/images/I/", re.I)
+_ORDER_NUMBER_RE = re.compile(r"^D?\d{2,3}-\d{7}-\d{7}$")
+_MONEY_TOKEN = (
+    r"(?:(?:US|CA|CDN)\s*\$|(?:USD|CAD)\s*|\$|£|€)\s*"
+    r"[0-9][0-9,]*(?:\.[0-9]{2})?"
+)
+_HSA_FSA_AMOUNT_RE = re.compile(
+    rf"(?P<label>\b(?:FSA\s*(?:or|/|&)\s*HSA|HSA\s*(?:or|/|&)\s*FSA)"
+    rf"\s+eligible(?:\s+amount)?(?:\s*\([^)]{{0,120}}\))?)"
+    rf"\s*:\s*(?P<amount>{_MONEY_TOKEN})",
+    re.I,
+)
+_ORDER_TOTAL_RE = re.compile(
+    rf"\b(?:Grand|Order)\s+Total\s*:\s*(?P<amount>{_MONEY_TOKEN})",
+    re.I,
+)
 
 
 async def _account_name(page: Page) -> str | None:
@@ -263,7 +185,9 @@ async def amazon_search(
             return json.dumps({"error": captcha})
 
         await page.wait_for_selector(
-            'div[data-component-type="s-search-result"]', timeout=10000
+            'div[data-component-type="s-search-result"]',
+            state="attached",
+            timeout=10000,
         )
 
         results = await page.evaluate(
@@ -1351,6 +1275,178 @@ async def _read_checkout_summary(page: Page) -> dict:
     )
 
 
+_SCRAPE_ORDER_HISTORY_PAGE = """
+() => {
+    const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+    const cards = [...document.querySelectorAll(
+        '.order-card, .js-order-card, [class*="order-card"]'
+    )];
+    const orders = [];
+    for (const c of cards) {
+        const full = clean(c.textContent);
+        const num = (c.querySelector('.yohtmlc-order-id')?.textContent || full)
+            .match(/(D?\\d{2,3}-\\d{7}-\\d{7})/);
+        // Header columns: order placed date + total are in the top bar.
+        const header = clean(
+            c.querySelector('.order-header, [class*="order-header"], .a-box-group .a-box:first-child')
+                ?.textContent
+        );
+        const date = (header.match(
+            /([0-9]{1,2}\\s+[A-Z][a-z]+\\s+[0-9]{4}|[A-Z][a-z]+\\s+[0-9]{1,2},?\\s+[0-9]{4})/
+        ) || [])[0] || null;
+        const total = (header.match(/(?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2}/) || [])[0] || null;
+        const titles = [...c.querySelectorAll(
+            '.yohtmlc-product-title, .a-link-normal[href*="/product/"], [class*="product-title"]'
+        )].map(e => clean(e.textContent)).filter(Boolean).slice(0, 5);
+        const status = clean(
+            c.querySelector('.delivery-box .a-text-bold, [class*="delivery"] .a-text-bold, .delivery-box')
+                ?.textContent
+        ).split(/(?=[A-Z][a-z])/)[0] || null;
+        const returnable = [...c.querySelectorAll('a')].some(
+            a => /return or replace|return item|replace item/i.test(a.textContent || '')
+        );
+        orders.push({
+            order_number: num ? num[1] : null,
+            date, total,
+            items: titles,
+            status: status || null,
+            returnable,
+        });
+    }
+
+    // Amazon's order-history page currently uses an a-pagination "last" item,
+    // but the rel/aria selectors cover alternate storefront markup.
+    const next = document.querySelector(
+        'ul.a-pagination li.a-last:not(.a-disabled) a, '
+        + '.a-pagination a[aria-label*="next" i], a[rel="next"]'
+    );
+    const nextHref = next?.getAttribute('href');
+
+    // Amazon exposes older history as separate year filters instead of one
+    // continuous result set. Discover the filters from both the select menu and
+    // link-based variants used by different storefronts.
+    const timeFilter = document.querySelector(
+        'select#time-filter, select[name="timeFilter"], select[name="orderFilter"]'
+    );
+    const filterFormAction = timeFilter?.closest('form')?.getAttribute('action');
+    const filterParamName = timeFilter?.getAttribute('name') || 'timeFilter';
+    const yearFilters = new Map();
+    const addYearFilter = (value) => {
+        if (!value) return;
+        let filter;
+        try {
+            const url = new URL(value, window.location.href);
+            filter = (
+                url.searchParams.get(filterParamName)
+                || url.searchParams.get('timeFilter')
+                || url.searchParams.get('orderFilter')
+            );
+        } catch (_) {
+            filter = value;
+        }
+        if (!filter && /^year-\\d{4}$/.test(value)) filter = value;
+        const match = filter?.match(/^year-(\\d{4})$/);
+        if (!match) return;
+
+        // The live route varies by storefront. Derive it from the filter form
+        // instead of assuming Amazon's legacy /gp/your-account path.
+        const url = new URL(
+            filterFormAction || '/your-orders/orders',
+            window.location.origin
+        );
+        url.search = '';
+        url.searchParams.set(filterParamName, filter);
+        yearFilters.set(Number(match[1]), url.href);
+    };
+    for (const option of document.querySelectorAll(
+        'select#time-filter option, select[name="orderFilter"] option'
+    )) {
+        addYearFilter(option.value);
+    }
+    for (const link of document.querySelectorAll(
+        'a[href*="orderFilter=year-"]'
+    )) {
+        addYearFilter(link.getAttribute('href'));
+    }
+
+    return {
+        orders,
+        next_url: nextHref ? new URL(nextHref, window.location.href).href : null,
+        active_filter: timeFilter?.value || null,
+        year_filter_urls: [...yearFilters]
+            .sort(([a], [b]) => b - a)
+            .map(([year, url]) => ({year, url})),
+    };
+}
+"""
+
+
+async def _collect_order_history(page: Page, max_orders: int) -> list[dict]:
+    """Collect orders across pagination and year filters, newest first."""
+    orders: list[dict] = []
+    seen_orders: set[str] = set()
+    visited_pages = {page.url}
+    queued_year_urls: set[str] = set()
+    pending_year_filters: list[tuple[int, str]] = []
+
+    while len(orders) < max_orders:
+        await page.wait_for_timeout(1500)
+        result = await page.evaluate(_SCRAPE_ORDER_HISTORY_PAGE)
+
+        for year_filter in result.get("year_filter_urls", []):
+            url = year_filter["url"]
+            if url not in visited_pages and url not in queued_year_urls:
+                queued_year_urls.add(url)
+                pending_year_filters.append((year_filter["year"], url))
+        pending_year_filters.sort(reverse=True)
+
+        for order in result["orders"]:
+            # Order numbers should always exist. The fallback prevents duplicate
+            # cards from leaking through if Amazon serves incomplete markup.
+            identity = order.get("order_number") or json.dumps(order, sort_keys=True)
+            if identity not in seen_orders:
+                seen_orders.add(identity)
+                orders.append(order)
+                if len(orders) == max_orders:
+                    break
+
+        next_url = result.get("next_url")
+        if len(orders) == max_orders:
+            break
+
+        # Once year filters are available, leave Amazon's overlapping three-month
+        # window after its first page and continue from the complete current year.
+        # This avoids scraping the same recent pages twice.
+        active_filter = result.get("active_filter") or ""
+        prefer_year_filter = (
+            not active_filter.startswith("year-") and pending_year_filters
+        )
+        destination = None
+        if not prefer_year_filter and next_url and next_url not in visited_pages:
+            destination = next_url
+        while not destination and pending_year_filters:
+            _, candidate = pending_year_filters.pop(0)
+            if candidate not in visited_pages:
+                destination = candidate
+        if not destination and next_url and next_url not in visited_pages:
+            destination = next_url
+
+        if not destination:
+            break
+
+        visited_pages.add(destination)
+        await page.goto(
+            destination,
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        captcha = await check_captcha(page)
+        if captcha:
+            raise RuntimeError(captcha)
+
+    return orders
+
+
 @mcp.tool()
 async def amazon_list_orders(max_orders: int = 10, domain: str = DEFAULT_DOMAIN) -> str:
     """List your recent Amazon orders.
@@ -1359,9 +1455,13 @@ async def amazon_list_orders(max_orders: int = 10, domain: str = DEFAULT_DOMAIN)
     it currently shows a "Return or replace items" option. Requires being logged in.
 
     Args:
-        max_orders: How many recent orders to return (default 10).
+        max_orders: How many recent orders to return across pages and yearly
+            history filters (default 10).
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
+    if isinstance(max_orders, bool) or not isinstance(max_orders, int) or max_orders < 1:
+        return json.dumps({"error": "max_orders must be a positive integer."})
+
     ctx = await get_logged_in_context()
     page = await ctx.new_page()
     try:
@@ -1376,55 +1476,306 @@ async def amazon_list_orders(max_orders: int = 10, domain: str = DEFAULT_DOMAIN)
         name = await _account_name(page)
         if not _is_logged_in(name):
             return json.dumps({"error": "Not logged in. Run amazon_login first."})
-        await page.wait_for_timeout(1500)
 
-        orders = await page.evaluate(
-            """
-            (maxOrders) => {
-                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                const cards = [...document.querySelectorAll(
-                    '.order-card, .js-order-card, [class*="order-card"]'
-                )];
-                const out = [];
-                for (const c of cards.slice(0, maxOrders)) {
-                    const full = clean(c.textContent);
-                    const num = (c.querySelector('.yohtmlc-order-id')?.textContent || full)
-                        .match(/(D?\\d{2,3}-\\d{7}-\\d{7})/);
-                    // Header columns: order placed date + total are in the top bar.
-                    const header = clean(
-                        c.querySelector('.order-header, [class*="order-header"], .a-box-group .a-box:first-child')
-                            ?.textContent
-                    );
-                    const date = (header.match(
-                        /([0-9]{1,2}\\s+[A-Z][a-z]+\\s+[0-9]{4}|[A-Z][a-z]+\\s+[0-9]{1,2},?\\s+[0-9]{4})/
-                    ) || [])[0] || null;
-                    const total = (header.match(/(?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2}/) || [])[0] || null;
-                    const titles = [...c.querySelectorAll(
-                        '.yohtmlc-product-title, .a-link-normal[href*="/product/"], [class*="product-title"]'
-                    )].map(e => clean(e.textContent)).filter(Boolean).slice(0, 5);
-                    const status = clean(
-                        c.querySelector('.delivery-box .a-text-bold, [class*="delivery"] .a-text-bold, .delivery-box')
-                            ?.textContent
-                    ).split(/(?=[A-Z][a-z])/)[0] || null;
-                    const returnable = [...c.querySelectorAll('a')].some(
-                        a => /return or replace|return item|replace item/i.test(a.textContent || '')
-                    );
-                    out.push({
-                        order_number: num ? num[1] : null,
-                        date, total,
-                        items: titles,
-                        status: status || null,
-                        returnable,
-                    });
-                }
-                return out;
-            }
-            """,
-            max_orders,
-        )
+        orders = await _collect_order_history(page, max_orders)
         return json.dumps({"count": len(orders), "orders": orders}, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e)})
+    finally:
+        await page.close()
+
+
+def _money_decimal(value: str | None) -> Decimal | None:
+    """Return the numeric portion of an Amazon money label for comparisons."""
+    if not value:
+        return None
+    numeric = re.sub(r"[^0-9.]", "", value)
+    try:
+        return Decimal(numeric)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_hsa_fsa_eligibility(document_text: str) -> dict:
+    """Extract Amazon's reported HSA/FSA amount and classify the order scope.
+
+    Missing eligibility text is deliberately `unknown`, not `none`: Amazon may
+    omit the field on unsupported storefronts or when its document layout changes.
+    """
+    text = re.sub(r"\s+", " ", document_text or "").strip()
+    eligible_match = _HSA_FSA_AMOUNT_RE.search(text)
+    total_match = _ORDER_TOTAL_RE.search(text)
+
+    eligible_amount = eligible_match.group("amount").strip() if eligible_match else None
+    order_total = total_match.group("amount").strip() if total_match else None
+    eligible_value = _money_decimal(eligible_amount)
+    total_value = _money_decimal(order_total)
+
+    scope = "unknown"
+    entire_order_eligible = None
+    if eligible_value is not None:
+        if eligible_value == 0:
+            scope = "none"
+            entire_order_eligible = False
+        elif total_value is not None and eligible_value == total_value:
+            scope = "full"
+            entire_order_eligible = True
+        elif total_value is not None and 0 < eligible_value < total_value:
+            scope = "partial"
+            entire_order_eligible = False
+
+    label = eligible_match.group("label") if eligible_match else ""
+    includes_tax_and_shipping = None
+    if eligible_match:
+        includes_tax_and_shipping = bool(
+            re.search(r"tax(?:es)?\s*(?:and|&)\s*shipping", label, re.I)
+        )
+
+    return {
+        "hsa_fsa_eligible_amount": eligible_amount,
+        "order_total": order_total,
+        "hsa_fsa_eligibility_scope": scope,
+        "entire_order_hsa_fsa_eligible": entire_order_eligible,
+        "hsa_fsa_amount_includes_tax_and_shipping": includes_tax_and_shipping,
+    }
+
+
+async def _load_printable_order_summary(
+    page: Page, order_number: str, domain: str
+) -> dict:
+    """Load and inspect Amazon's authenticated printable order document."""
+    source_url = (
+        f"https://www.amazon.{domain}/gp/css/summary/print.html"
+        f"?orderID={quote_plus(order_number)}"
+    )
+    await page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
+    captcha = await check_captcha(page)
+    if captcha:
+        return {"error": captcha, "source_url": page.url}
+
+    # Amazon's printable view intentionally omits the normal account-name
+    # element, even for authenticated sessions. Detect the sign-in surface and
+    # verify access by requiring the requested order number in the document.
+    sign_in = await page.query_selector(
+        'form[name="signIn"], input#ap_email, input#ap_password'
+    )
+    if sign_in or re.search(r"/(?:ap/)?signin", page.url, re.I):
+        return {"error": "Not logged in. Run amazon_login first.", "source_url": page.url}
+
+    details = await page.evaluate(
+        """
+        (orderNumber) => {
+            const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+            const body = clean(document.body?.innerText);
+            const heading = clean(
+                document.querySelector('h1, h2, [role="heading"]')?.textContent
+            );
+            const lower = `${heading} ${document.title} ${body.slice(0, 500)}`
+                .toLowerCase();
+            let documentType = 'order_summary';
+            if (/tax invoice|vat invoice/.test(lower)) documentType = 'tax_invoice';
+            else if (/\\binvoice\\b/.test(lower) && !/view invoice/.test(lower)) {
+                documentType = 'invoice';
+            }
+            return {
+                heading: heading || null,
+                title: document.title || null,
+                document_type: documentType,
+                contains_order_number: body.includes(orderNumber),
+                unavailable: /request invoice|invoice (?:is )?not available/i.test(body),
+                body_text: body,
+            };
+        }
+        """,
+        order_number,
+    )
+    body_text = details.pop("body_text", "")
+    details.update(_parse_hsa_fsa_eligibility(body_text))
+    details["source_url"] = page.url
+
+    if details.get("unavailable"):
+        return {
+            "error": "Amazon does not currently provide an invoice for this order.",
+            "order_number": order_number,
+            "action_required": "Request the invoice from the seller in Your Orders.",
+            "source_url": page.url,
+        }
+    if not details.get("contains_order_number"):
+        return {
+            "error": "Amazon did not return a printable document for this order. "
+            "Check that the order number belongs to this account and has shipped.",
+            "order_number": order_number,
+            "source_url": page.url,
+        }
+    return details
+
+
+@mcp.tool()
+async def amazon_order_hsa_eligibility(
+    order_number: str, domain: str = DEFAULT_DOMAIN
+) -> str:
+    """Report how much of an Amazon order is marked HSA/FSA eligible.
+
+    Returns Amazon's reported eligible amount and an eligibility scope: `full`,
+    `partial`, `none`, or `unknown`. `unknown` means Amazon did not expose enough
+    information to classify the order; it must not be treated as zero eligibility.
+    This read-only tool does not download or save the order document.
+
+    Args:
+        order_number: Amazon order number, e.g. "112-1234567-1234567".
+        domain: Amazon domain — use "com" for the US HSA/FSA program.
+    """
+    order_number = str(order_number).strip()
+    if not _ORDER_NUMBER_RE.fullmatch(order_number):
+        return json.dumps(
+            {
+                "error": "Invalid Amazon order number. Expected a value like "
+                "112-1234567-1234567."
+            }
+        )
+
+    ctx = await get_logged_in_context()
+    page = await ctx.new_page()
+    try:
+        details = await _load_printable_order_summary(page, order_number, domain)
+        if details.get("error"):
+            return json.dumps(details, indent=2)
+        return json.dumps(
+            {
+                "order_number": order_number,
+                "hsa_fsa_eligible_amount": details["hsa_fsa_eligible_amount"],
+                "order_total": details["order_total"],
+                "hsa_fsa_eligibility_scope": details["hsa_fsa_eligibility_scope"],
+                "entire_order_hsa_fsa_eligible": details[
+                    "entire_order_hsa_fsa_eligible"
+                ],
+                "hsa_fsa_amount_includes_tax_and_shipping": details[
+                    "hsa_fsa_amount_includes_tax_and_shipping"
+                ],
+                "source_url": details["source_url"],
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "order_number": order_number})
+    finally:
+        await page.close()
+
+
+@mcp.tool()
+async def amazon_download_invoice(
+    order_number: str,
+    output_format: str = "pdf",
+    domain: str = DEFAULT_DOMAIN,
+) -> str:
+    """Download the invoice or printable order summary for an Amazon order.
+
+    Amazon.com currently labels its link "View invoice" but serves a printable
+    Order Summary. Other storefronts may serve an invoice instead. This tool
+    preserves that distinction in `document_type` and never claims that a
+    locally rendered order summary is an official or tax invoice.
+
+    The document is saved under AMAZON_INVOICE_DIR (default:
+    ~/.amazon-mcp/invoices). PDF is recommended; HTML saves the authenticated
+    page markup and may depend on Amazon-hosted styles when opened later.
+
+    Args:
+        order_number: Amazon order number, e.g. "112-1234567-1234567".
+        output_format: "pdf" (default) or "html".
+        domain: Amazon domain — "ca" for Canada, "com" for US.
+    """
+    order_number = str(order_number).strip()
+    if not _ORDER_NUMBER_RE.fullmatch(order_number):
+        return json.dumps(
+            {
+                "error": "Invalid Amazon order number. Expected a value like "
+                "112-1234567-1234567."
+            }
+        )
+
+    output_format = str(output_format).strip().lower()
+    if output_format not in {"pdf", "html"}:
+        return json.dumps({"error": "output_format must be 'pdf' or 'html'."})
+
+    ctx = await get_logged_in_context()
+    page = await ctx.new_page()
+    try:
+        # Page routes take precedence over the context-level media blocker.
+        await page.route(_PRODUCT_IMAGE_RE, lambda route: route.continue_())
+        details = await _load_printable_order_summary(page, order_number, domain)
+        if details.get("error"):
+            return json.dumps(details, indent=2)
+
+        document_type = details["document_type"]
+        destination_dir = Path(INVOICE_DIR).expanduser().resolve()
+        destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination_dir.chmod(0o700)
+        destination = destination_dir / (
+            f"amazon-{document_type}-{order_number}.{output_format}"
+        )
+
+        if output_format == "pdf":
+            try:
+                await page.wait_for_function(
+                    """
+                    () => [...document.querySelectorAll('img[alt]:not([alt=""])')]
+                        .every(img => img.complete && img.naturalWidth > 0)
+                    """,
+                    timeout=5000,
+                )
+            except Exception:
+                pass  # the text summary is still complete if an image fails
+            # Amazon's full site footer adds a large dark block to the one-page
+            # printable summary and is not part of the order document.
+            await page.add_style_tag(content="#navFooter { display: none !important; }")
+            await page.pdf(
+                path=str(destination),
+                format="Letter",
+                print_background=True,
+                prefer_css_page_size=True,
+                margin={
+                    "top": "0.4in",
+                    "right": "0.4in",
+                    "bottom": "0.4in",
+                    "left": "0.4in",
+                },
+            )
+            mime_type = "application/pdf"
+        else:
+            destination.write_text(await page.content(), encoding="utf-8")
+            mime_type = "text/html"
+        destination.chmod(0o600)
+
+        official_invoice = document_type in {"invoice", "tax_invoice"}
+        return json.dumps(
+            {
+                "downloaded": True,
+                "order_number": order_number,
+                "document_type": document_type,
+                "official_invoice": official_invoice,
+                "output_format": output_format,
+                "mime_type": mime_type,
+                "path": str(destination),
+                "size_bytes": destination.stat().st_size,
+                "source_url": page.url,
+                "hsa_fsa_eligible_amount": details["hsa_fsa_eligible_amount"],
+                "order_total": details["order_total"],
+                "hsa_fsa_eligibility_scope": details["hsa_fsa_eligibility_scope"],
+                "entire_order_hsa_fsa_eligible": details[
+                    "entire_order_hsa_fsa_eligible"
+                ],
+                "hsa_fsa_amount_includes_tax_and_shipping": details[
+                    "hsa_fsa_amount_includes_tax_and_shipping"
+                ],
+                "note": None
+                if official_invoice
+                else "Amazon supplied a printable order summary, not an official "
+                "or tax invoice.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "order_number": order_number})
     finally:
         await page.close()
 
