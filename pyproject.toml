@@ -8,9 +8,14 @@ dependencies = [
     "playwright>=1.40.0",
 ]
 
+[project.optional-dependencies]
+camoufox = [
+    "camoufox[geoip]>=0.4.0",
+]
+
 [project.scripts]
 amazon-mcp = "amazon_mcp:main"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.11.0,<0.14"]
+build-backend = "uv_build"
