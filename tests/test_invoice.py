@@ -1,215 +1,264 @@
-import json
 import os
+from pathlib import Path
+import stat
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from mcp.server.fastmcp.exceptions import ToolError
+from playwright.async_api import async_playwright
+
+from amazon_mcp.orders import (
+    DownloadInvoiceResult,
+    OrderDocumentResult,
+    SCRAPE_DOCUMENT_DOM_SCRIPT,
+    download_order_invoice,
+    fetch_order_document,
+    reset_order_pace,
+)
 from amazon_mcp.server import (
-    _parse_hsa_fsa_eligibility,
     amazon_download_invoice,
-    amazon_order_hsa_eligibility,
+    amazon_get_order_document,
 )
 
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-class FakePage:
-    def __init__(self, details):
-        self.url = "about:blank"
-        self.details = details
-        self.route = AsyncMock()
-        self.goto = AsyncMock(side_effect=self._goto)
-        self.query_selector = AsyncMock(return_value=None)
-        self.evaluate = AsyncMock(return_value=details)
+
+def _read_fixture(name: str) -> str:
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+class DOMDocumentExtractionTests(unittest.IsolatedAsyncioTestCase):
+    """Tests SCRAPE_DOCUMENT_DOM_SCRIPT directly against real printable fixtures."""
+
+    async def asyncSetUp(self):
+        self.pw = await async_playwright().start()
+        self.browser = await self.pw.chromium.launch(headless=True)
+        self.page = await self.browser.new_page()
+
+    async def asyncTearDown(self):
+        await self.page.close()
+        await self.browser.close()
+        await self.pw.stop()
+
+    async def test_extracts_printable_document_info(self):
+        html = _read_fixture("order_summary_printable.html")
+        await self.page.set_content(html)
+        result = await self.page.evaluate(SCRAPE_DOCUMENT_DOM_SCRIPT)
+
+        self.assertEqual(result["heading"], "Final Details for Order #114-7654321-1234567")
+        self.assertEqual(result["title"], "Amazon.com - Printable Order Summary")
+        self.assertEqual(result["document_type"], "order_summary")
+        self.assertFalse(result["unavailable"])
+        self.assertTrue(result["contains_order_number"])
+        self.assertIn("114-7654321-1234567", result["body_text"])
+        self.assertIn("Logitech Wireless Mouse", result["body_text"])
+        self.assertIn("HSA or FSA eligible amount", result["body_text"])
+        self.assertIn("$27.28", result["body_text"])
+
+
+class FakeDocumentPage:
+    def __init__(self, doc_data, content_html="<html><body><h1>Test Doc</h1></body></html>"):
+        self.url = "https://www.amazon.ca/gp/css/summary/print.html?orderID=114-7654321-1234567"
+        self.doc_data = doc_data
+        self._content_html = content_html
+        self.goto = AsyncMock()
         self.wait_for_function = AsyncMock()
+        self.query_selector = AsyncMock(return_value=None)
+        self.route = AsyncMock()
         self.add_style_tag = AsyncMock()
+        self.content = AsyncMock(return_value=self._content_html)
         self.pdf = AsyncMock(side_effect=self._pdf)
-        self.content = AsyncMock(return_value="<html><h1>Order Summary</h1></html>")
         self.close = AsyncMock()
 
-    async def _goto(self, url, **_kwargs):
-        self.url = url
+    async def evaluate(self, _script, *_args, **_kwargs):
+        return self.doc_data
 
-    async def _pdf(self, *, path, **_kwargs):
-        Path(path).write_bytes(b"%PDF-1.7\nfake invoice\n")
-
-
-class FakeContext:
-    def __init__(self, page):
-        self.page = page
-        self.new_page = AsyncMock(return_value=page)
+    async def _pdf(self, path=None, **_kwargs):
+        if path:
+            Path(path).write_bytes(b"%PDF-1.7\nSample Rendered PDF Document\n")
 
 
-class HsaFsaParserTests(unittest.TestCase):
-    def test_classifies_partially_eligible_order(self):
-        result = _parse_hsa_fsa_eligibility(
-            "Grand Total: $54.29 "
-            "FSA or HSA eligible amount (includes taxes & shipping): $27.28"
+class _OrderPaceOff:
+    """Keep invoice tests out of the process-wide order pacing window."""
+
+    async def asyncSetUp(self):
+        reset_order_pace()
+        self._pace_off = patch.dict(os.environ, {"AMAZON_HUMAN_PAUSE": "0"})
+        self._pace_off.start()
+
+    async def asyncTearDown(self):
+        self._pace_off.stop()
+        reset_order_pace()
+
+
+class OrderDocumentToolTests(_OrderPaceOff, unittest.IsolatedAsyncioTestCase):
+    """Tests amazon_get_order_document and fetch_order_document."""
+
+    async def test_rejects_invalid_order_number(self):
+        with self.assertRaises(ToolError) as ctx:
+            await amazon_get_order_document("invalid-order")
+        self.assertIn("Invalid Amazon order number", str(ctx.exception))
+
+    async def test_fetches_printable_order_document_success(self):
+        page = FakeDocumentPage({
+            "heading": "Order Summary",
+            "title": "Printable Order Summary",
+            "document_type": "order_summary",
+            "contains_order_number": True,
+            "unavailable": False,
+            "body_text": "Order Placed: Sept 12, 2026\nOrder Total: $45.99",
+            "links": [{"label": "Help", "url": "https://www.amazon.ca/help"}],
+        })
+
+        res: OrderDocumentResult = await fetch_order_document(
+            page=page,
+            order_number="114-7654321-1234567",
+            domain="ca",
+            check_captcha_fn=AsyncMock(return_value=None),
         )
 
-        self.assertEqual("$27.28", result["hsa_fsa_eligible_amount"])
-        self.assertEqual("$54.29", result["order_total"])
-        self.assertEqual("partial", result["hsa_fsa_eligibility_scope"])
-        self.assertFalse(result["entire_order_hsa_fsa_eligible"])
-        self.assertTrue(result["hsa_fsa_amount_includes_tax_and_shipping"])
+        self.assertEqual(res.order_number, "114-7654321-1234567")
+        self.assertEqual(res.heading, "Order Summary")
+        self.assertEqual(res.document_type, "order_summary")
+        self.assertIn("$45.99", res.body_text)
+        self.assertEqual(len(res.links), 1)
 
-    def test_classifies_fully_eligible_order(self):
-        result = _parse_hsa_fsa_eligibility(
-            "Order Total: US$ 12.00 "
-            "HSA/FSA eligible (inc. tax and shipping): US$ 12.00"
-        )
+    async def test_unavailable_document_raises_tool_error(self):
+        page = FakeDocumentPage({
+            "heading": None,
+            "title": "Amazon.ca",
+            "document_type": "order_summary",
+            "contains_order_number": False,
+            "unavailable": True,
+            "body_text": "An invoice is not available for this order.",
+            "links": [],
+        })
 
-        self.assertEqual("full", result["hsa_fsa_eligibility_scope"])
-        self.assertTrue(result["entire_order_hsa_fsa_eligible"])
-
-    def test_classifies_explicit_zero_as_none(self):
-        result = _parse_hsa_fsa_eligibility(
-            "Grand Total: $40.00 FSA or HSA eligible amount: $0.00"
-        )
-
-        self.assertEqual("none", result["hsa_fsa_eligibility_scope"])
-        self.assertFalse(result["entire_order_hsa_fsa_eligible"])
-
-    def test_missing_eligibility_text_is_unknown_not_zero(self):
-        result = _parse_hsa_fsa_eligibility("Grand Total: $40.00")
-
-        self.assertIsNone(result["hsa_fsa_eligible_amount"])
-        self.assertEqual("unknown", result["hsa_fsa_eligibility_scope"])
-        self.assertIsNone(result["entire_order_hsa_fsa_eligible"])
+        with self.assertRaises(ToolError) as ctx:
+            await fetch_order_document(
+                page=page,
+                order_number="114-7654321-1234567",
+                domain="ca",
+                check_captcha_fn=AsyncMock(return_value=None),
+            )
+        self.assertIn("does not currently provide", str(ctx.exception))
 
 
-class DownloadInvoiceTests(unittest.IsolatedAsyncioTestCase):
-    @patch("amazon_mcp.server.get_logged_in_context", new_callable=AsyncMock)
-    async def test_rejects_invalid_order_number_before_opening_browser(self, browser):
-        result = json.loads(await amazon_download_invoice("not-an-order"))
+class DownloadInvoiceToolTests(_OrderPaceOff, unittest.IsolatedAsyncioTestCase):
+    """Tests amazon_download_invoice permissions, HTML/PDF formats, and backend rejection."""
 
-        self.assertIn("Invalid Amazon order number", result["error"])
-        browser.assert_not_awaited()
+    async def test_rejects_invalid_order_number(self):
+        with self.assertRaises(ToolError) as ctx:
+            await amazon_download_invoice("bad-number")
+        self.assertIn("Invalid Amazon order number", str(ctx.exception))
 
-    async def test_saves_printable_order_summary_as_private_pdf(self):
-        page = FakePage(
+    async def test_rejects_invalid_format(self):
+        with self.assertRaises(ToolError) as ctx:
+            await amazon_download_invoice("114-7654321-1234567", output_format="docx")
+        self.assertIn("Invalid output_format", str(ctx.exception))
+
+    async def test_camoufox_explicitly_rejects_pdf_before_writing_file(self):
+        page = FakeDocumentPage({
+            "heading": "Order Summary",
+            "title": "Printable Order Summary",
+            "document_type": "order_summary",
+            "contains_order_number": True,
+            "unavailable": False,
+            "body_text": "Order Details",
+            "links": [],
+        })
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.dict(os.environ, {"AMAZON_BROWSER_BACKEND": "camoufox"}):
+                with self.assertRaises(ToolError) as ctx:
+                    await download_order_invoice(
+                        page=page,
+                        order_number="114-7654321-1234567",
+                        output_format="pdf",
+                        domain="ca",
+                        invoice_dir=tmp_dir,
+                        check_captcha_fn=AsyncMock(return_value=None),
+                    )
+                self.assertIn("Camoufox", str(ctx.exception))
+                self.assertIn("output_format='html'", str(ctx.exception))
+                # Ensure no files were written
+                self.assertEqual(len(list(Path(tmp_dir).iterdir())), 0)
+                page.pdf.assert_not_awaited()
+
+    async def test_downloads_html_with_private_permissions(self):
+        page = FakeDocumentPage(
             {
-                "heading": "Order Summary",
-                "title": "Order Details",
+                "heading": "Final Details for Order #114-7654321-1234567",
+                "title": "Amazon.ca - Printable Order Summary",
                 "document_type": "order_summary",
                 "contains_order_number": True,
                 "unavailable": False,
-                "body_text": (
-                    "Order 112-1234567-1234567 Grand Total: $54.29 "
-                    "FSA or HSA eligible amount "
-                    "(includes taxes & shipping): $27.28"
-                ),
-            }
+                "body_text": "Order Details",
+                "links": [],
+            },
+            content_html="<html><head><title>Test</title></head><body><h1>Order Summary</h1></body></html>",
         )
-        context = FakeContext(page)
-        with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "amazon_mcp.server.INVOICE_DIR", temp_dir
-        ), patch(
-            "amazon_mcp.server.get_logged_in_context",
-            new_callable=AsyncMock,
-            return_value=context,
-        ), patch(
-            "amazon_mcp.server.check_captcha",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            result = json.loads(
-                await amazon_download_invoice(
-                    "112-1234567-1234567", domain="com"
-                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            res: DownloadInvoiceResult = await download_order_invoice(
+                page=page,
+                order_number="114-7654321-1234567",
+                output_format="html",
+                domain="ca",
+                invoice_dir=tmp_dir,
+                check_captcha_fn=AsyncMock(return_value=None),
             )
 
-            destination = Path(result["path"])
-            self.assertTrue(result["downloaded"])
-            self.assertEqual("order_summary", result["document_type"])
-            self.assertFalse(result["official_invoice"])
-            self.assertEqual("application/pdf", result["mime_type"])
-            self.assertEqual("$27.28", result["hsa_fsa_eligible_amount"])
-            self.assertEqual("partial", result["hsa_fsa_eligibility_scope"])
-            self.assertFalse(result["entire_order_hsa_fsa_eligible"])
-            self.assertEqual(b"%PDF-1.7\nfake invoice\n", destination.read_bytes())
-            self.assertEqual(0o600, os.stat(destination).st_mode & 0o777)
-            page.pdf.assert_awaited_once()
-            page.close.assert_awaited_once()
+            self.assertTrue(res.downloaded)
+            self.assertEqual(res.output_format, "html")
+            self.assertEqual(res.order_number, "114-7654321-1234567")
+            self.assertEqual(res.heading, "Final Details for Order #114-7654321-1234567")
 
-    async def test_reports_seller_invoice_request_without_writing_file(self):
-        page = FakePage(
-            {
-                "heading": None,
-                "title": "Order Details",
-                "document_type": "order_summary",
-                "contains_order_number": True,
-                "unavailable": True,
-            }
-        )
-        context = FakeContext(page)
-        with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "amazon_mcp.server.INVOICE_DIR", temp_dir
-        ), patch(
-            "amazon_mcp.server.get_logged_in_context",
-            new_callable=AsyncMock,
-            return_value=context,
-        ), patch(
-            "amazon_mcp.server.check_captcha",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            result = json.loads(
-                await amazon_download_invoice(
-                    "112-1234567-1234567", domain="com"
+            saved_path = Path(res.path)
+            self.assertTrue(saved_path.is_file())
+            self.assertEqual(saved_path.suffix, ".html")
+
+            # Check directory permissions (0o700) and file permissions (0o600)
+            file_mode = stat.S_IMODE(saved_path.stat().st_mode)
+            dir_mode = stat.S_IMODE(saved_path.parent.stat().st_mode)
+            self.assertEqual(file_mode, 0o600)
+            self.assertEqual(dir_mode, 0o700)
+
+            content = saved_path.read_text(encoding="utf-8")
+            self.assertIn("<h1>Order Summary</h1>", content)
+
+    async def test_downloads_pdf_with_chromium_backend(self):
+        page = FakeDocumentPage({
+            "heading": "Final Details for Order #114-7654321-1234567",
+            "title": "Amazon.ca - Printable Order Summary",
+            "document_type": "order_summary",
+            "contains_order_number": True,
+            "unavailable": False,
+            "body_text": "Order Details",
+            "links": [],
+        })
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.dict(os.environ, {"AMAZON_BROWSER_BACKEND": "playwright"}):
+                res: DownloadInvoiceResult = await download_order_invoice(
+                    page=page,
+                    order_number="114-7654321-1234567",
+                    output_format="pdf",
+                    domain="ca",
+                    invoice_dir=tmp_dir,
+                    check_captcha_fn=AsyncMock(return_value=None),
                 )
-            )
 
-            self.assertIn("does not currently provide an invoice", result["error"])
-            self.assertEqual("Request the invoice from the seller in Your Orders.", result["action_required"])
-            self.assertEqual([], list(Path(temp_dir).iterdir()))
-            page.pdf.assert_not_awaited()
+                self.assertTrue(res.downloaded)
+                self.assertEqual(res.output_format, "pdf")
+                saved_path = Path(res.path)
+                self.assertTrue(saved_path.is_file())
+                self.assertEqual(saved_path.suffix, ".pdf")
+                page.pdf.assert_awaited_once()
 
-
-class OrderHsaEligibilityTests(unittest.IsolatedAsyncioTestCase):
-    @patch("amazon_mcp.server.get_logged_in_context", new_callable=AsyncMock)
-    async def test_rejects_invalid_order_number_before_opening_browser(self, browser):
-        result = json.loads(await amazon_order_hsa_eligibility("not-an-order"))
-
-        self.assertIn("Invalid Amazon order number", result["error"])
-        browser.assert_not_awaited()
-
-    async def test_reports_amount_and_partial_scope_without_saving_document(self):
-        page = FakePage(
-            {
-                "heading": "Order Summary",
-                "title": "Order Details",
-                "document_type": "order_summary",
-                "contains_order_number": True,
-                "unavailable": False,
-                "body_text": (
-                    "Order 112-1234567-1234567 Grand Total: $54.29 "
-                    "FSA or HSA eligible amount "
-                    "(includes taxes & shipping): $27.28"
-                ),
-            }
-        )
-        context = FakeContext(page)
-        with patch(
-            "amazon_mcp.server.get_logged_in_context",
-            new_callable=AsyncMock,
-            return_value=context,
-        ), patch(
-            "amazon_mcp.server.check_captcha",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            result = json.loads(
-                await amazon_order_hsa_eligibility(
-                    "112-1234567-1234567", domain="com"
-                )
-            )
-
-        self.assertEqual("$27.28", result["hsa_fsa_eligible_amount"])
-        self.assertEqual("partial", result["hsa_fsa_eligibility_scope"])
-        self.assertFalse(result["entire_order_hsa_fsa_eligible"])
-        page.pdf.assert_not_awaited()
-        page.content.assert_not_awaited()
-        page.close.assert_awaited_once()
+                # Verify permissions
+                self.assertEqual(stat.S_IMODE(saved_path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

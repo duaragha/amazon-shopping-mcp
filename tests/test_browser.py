@@ -1,15 +1,24 @@
+import asyncio
+import fcntl
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from amazon_mcp.browser import (
+    ProfileInUseError,
+    acquire_profile_lock,
+    authenticated_lock,
     close_all_browsers,
     close_logged_in_context,
     create_page,
     get_browser,
     get_browser_backend,
-    get_user_data_dir,
     get_logged_in_context,
+    get_user_data_dir,
+    release_profile_lock,
+    reset_session,
 )
 
 
@@ -152,3 +161,95 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
             page = await create_page(block_media=True)
             self.assertEqual(page, fake_page)
             fake_context.route.assert_awaited_once()
+
+
+class ProfileLockTests(unittest.TestCase):
+    def tearDown(self):
+        release_profile_lock()
+
+    def test_acquire_and_release_profile_lock(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lock_path = Path(tmp_dir) / ".amazon_mcp.lock"
+            acquire_profile_lock(tmp_dir)
+            self.assertTrue(lock_path.is_file())
+            content = lock_path.read_text(encoding="utf-8")
+            self.assertIn(f"PID {os.getpid()}", content)
+            release_profile_lock()
+
+    def test_profile_in_use_error_when_locked_by_another_process(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lock_path = Path(tmp_dir) / ".amazon_mcp.lock"
+            with open(lock_path, "a+") as f:
+                f.write("PID=99999\nSTART_TIME=2026-09-16T12:00:00Z\n")
+                f.flush()
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with self.assertRaises(ProfileInUseError) as ctx:
+                        acquire_profile_lock(tmp_dir)
+                    self.assertIn("PID=99999", str(ctx.exception))
+                    self.assertIn(tmp_dir, str(ctx.exception))
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+class SessionResetAndConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await close_all_browsers()
+
+    async def asyncTearDown(self):
+        await close_all_browsers()
+
+    async def test_reset_session_closes_browsers_and_preserves_profile(self):
+        result = await reset_session()
+        self.assertTrue(result["session_reset"])
+        self.assertIn("user_data_dir", result)
+        self.assertIn("Browser session closed", result["message"])
+
+    async def test_amazon_reset_session_does_not_deadlock(self):
+        from amazon_mcp.server import amazon_reset_session
+
+        result = await asyncio.wait_for(amazon_reset_session(), timeout=2)
+        self.assertTrue(result.session_reset)
+
+    @patch.dict(os.environ, {"AMAZON_BROWSER_BACKEND": "playwright"})
+    async def test_concurrent_get_browser_calls_share_initialization(self):
+        fake_browser = MagicMock()
+        fake_browser.is_connected.return_value = True
+
+        fake_pw = MagicMock()
+        launch_mock = AsyncMock(return_value=fake_browser)
+        fake_pw.chromium.launch = launch_mock
+
+        with patch("amazon_mcp.browser.async_playwright") as mock_pw_init:
+            pw_cm = MagicMock()
+            pw_cm.start = AsyncMock(return_value=fake_pw)
+            mock_pw_init.return_value = pw_cm
+
+            # Run 5 concurrent calls
+            results = await asyncio.gather(
+                get_browser(),
+                get_browser(),
+                get_browser(),
+                get_browser(),
+                get_browser(),
+            )
+
+            # All 5 return the same browser instance
+            for b in results:
+                self.assertEqual(b, fake_browser)
+
+            # launch should only have been called once
+            self.assertEqual(launch_mock.await_count, 1)
+
+    async def test_authenticated_lock_serializes_operations(self):
+        order = []
+
+        async def worker(n: int, delay: float):
+            async with authenticated_lock():
+                order.append(f"start-{n}")
+                await asyncio.sleep(delay)
+                order.append(f"end-{n}")
+
+        await asyncio.gather(worker(1, 0.05), worker(2, 0.01))
+        # Worker 1 runs to completion before worker 2 enters
+        self.assertEqual(order, ["start-1", "end-1", "start-2", "end-2"])

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Your Orders</title>
+</head>
+<body>
+<div id="navbar">
+    <a href="/gp/css/order-history" id="nav-link-accountList-nav-line-1">Hello, TestUser</a>
+</div>
+<div id="yourOrders" class="your-orders-content-container">
+    <div class="a-row a-spacing-base">
+        <form action="/your-orders/orders" method="get">
+            <select id="time-filter" name="orderFilter">
+                <option value="year-2026" selected>2026</option>
+                <option value="year-2025">2025</option>
+                <option value="year-2024">2024</option>
+            </select>
+        </form>
+    </div>
+    <div id="ordersContainer">
+        <!-- Order Card 1: Standard card with returnable item and payment -->
+        <div class="order-card js-order-card" data-component-type="orderCard">
+            <div class="order-header a-box-group">
+                <div class="a-box a-color-offset-background">
+                    <span class="a-color-secondary">ORDER PLACED</span>
+                    <span class="value">12 September 2026</span>
+                    <span class="a-color-secondary">TOTAL</span>
+                    <span class="value">$45.99</span>
+                    <span class="a-color-secondary">SHIP TO</span>
+                    <span class="recipient">Jane Doe</span>
+                    <span class="a-color-secondary">ORDER #</span>
+                    <span class="yohtmlc-order-id">114-7654321-1234567</span>
+                </div>
+            </div>
+            <div class="order-body a-box">
+                <div class="delivery-box">
+                    <span class="a-text-bold">Delivered today by 8 PM</span>
+                    <div class="a-color-secondary">Your package was left near the front door.</div>
+                </div>
+                <div class="a-row product-details">
+                    <a class="yohtmlc-product-title a-link-normal" href="/dp/B001234567">Logitech Wireless Mouse</a>
+                    <div class="a-size-small">Sold by: Amazon.com Services LLC</div>
+                </div>
+                <div class="a-row product-details">
+                    <a class="a-link-normal" href="/product/B007654321">USB-C Fast Charging Cable 6ft</a>
+                    <div class="a-size-small">Sold by: CableDirect</div>
+                </div>
+                <div class="payment-section">
+                    <span>Paying with Visa 1234</span>
+                </div>
+                <div class="actions">
+                    <a class="a-button-text" href="/gp/css/summary/print.html?orderID=114-7654321-1234567">View invoice</a>
+                    <a class="a-button-text" href="/spr/returns/cart?orderId=114-7654321-1234567">Return or replace items</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Order Card 2: Nested multiple shipments -->
+        <div class="order-card a-box-group" data-component-type="orderCard">
+            <div class="order-header">
+                <div class="a-box">
+                    <span>Order placed August 15, 2026</span>
+                    <span>Total: $129.50</span>
+                    <span>Order # D01-9876543-0123456</span>
+                </div>
+            </div>
+            <div class="a-box shipment-1">
+                <div class="shipment-status">
+                    <span class="a-text-bold">Delivered Aug 18, 2026</span>
+                </div>
+                <div class="item">
+                    <a class="yohtmlc-product-title" href="/dp/B009999999">Mechanical Gaming Keyboard RGB</a>
+                </div>
+            </div>
+            <div class="a-box shipment-2">
+                <div class="shipment-status">
+                    <span class="a-text-bold">Arriving tomorrow</span>
+                </div>
+                <div class="item">
+                    <a class="yohtmlc-product-title" href="/dp/B008888888">Ergonomic Memory Foam Wrist Rest</a>
+                </div>
+            </div>
+            <div class="meta">
+                <div>Paying with Mastercard 5678</div>
+                <div>HSA/FSA eligible amount: $0.00</div>
+                <a href="/gp/your-account/order-details?orderID=D01-9876543-0123456">View order details</a>
+            </div>
+        </div>
+    </div>
+    <ul class="a-pagination">
+        <li class="a-last">
+            <a href="/your-orders/orders?page=2" rel="next" aria-label="Next page">Next</a>
+        </li>
+    </ul>
+</div>
+</body>
+</html>

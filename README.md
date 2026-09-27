@@ -27,7 +27,7 @@ Built with Playwright for reliable browsing that doesn't get blocked like simple
 
 | Tool | Description |
 |---|---|
-| `amazon_login` | Opens a **real, visible** browser window so you can sign in (incl. 2FA) by hand. Session is saved to disk and reused by every tool below |
+| `amazon_login` | Opens a **real, visible** browser window and waits until you sign in by hand (password and 2FA). Session is saved to disk and reused by every tool below |
 | `amazon_login_status` | Check whether the saved session is still signed in, and as whom |
 | `amazon_list_addresses` | List shipping addresses saved in your account, each with an `index` for checkout |
 | `amazon_list_payment_methods` | List saved cards — **last 4 digits, network, and expiry only**, each with an `index` |
@@ -35,12 +35,17 @@ Built with Playwright for reliable browsing that doesn't get blocked like simple
 | `amazon_view_cart` | View cart line items, quantities, and subtotal |
 | `amazon_place_order` | Walk through checkout. Default = **preview only** (returns ship-to / payment / total). Call again with `confirm=true` to actually place the order |
 | `amazon_subscribe` | Set up Subscribe & Save on a product. Default = **preview only** (base price / discount / cadence). `confirm=true` creates the **recurring** subscription |
+| `amazon_reset_session` | Close active browser instances and release profile locks while preserving saved login credentials on disk |
 
 ### Orders & returns (requires `amazon_login` first)
 
 | Tool | Description |
 |---|---|
-| `amazon_list_orders` | List recent orders — number, date, total, items, delivery status, and whether a return is currently offered |
+| `amazon_list_orders` | List orders across paginated and yearly history with a 5-page budget, continuation token, and stop reason |
+| `amazon_search_orders` | Search past orders by keyword using Amazon's order search form |
+| `amazon_get_order` | Fetch direct details, scoped card text, and labeled links for a specific order number |
+| `amazon_get_order_document` | Extract visible text, labeled links, and heading from an order's printable summary or invoice document (replaces `amazon_order_hsa_eligibility`) |
+| `amazon_download_invoice` | Save an order's invoice or printable summary as HTML (default) or rendered PDF (Chromium), with private file permissions |
 | `amazon_view_returns` | List in-progress / past returns with their status (from the returns-filtered order history) |
 | `amazon_start_return` | Open the return wizard for an order. Default = **preview only** (returnable items + reason options); `confirm=true` to submit |
 
@@ -56,26 +61,30 @@ Built with Playwright for reliable browsing that doesn't get blocked like simple
 ```bash
 git clone https://github.com/duaragha/amazon-shopping-mcp.git
 cd amazon-shopping-mcp
+
+# Option A: Default with Playwright
 uv sync
-```
-
-Install a browser for Playwright:
-
-```bash
-# Use bundled Chromium (works everywhere, recommended)
 .venv/bin/playwright install chromium
 
-# Or use an existing browser by setting BROWSER_CHANNEL:
-# "chrome", "msedge", etc. — no Playwright install needed
+# Option B: Optional Camoufox anti-detect browser (https://camoufox.com/)
+uv sync --extra camoufox
+uv run camoufox fetch
 ```
+
+# Or use an existing browser for Playwright by setting BROWSER_CHANNEL:
+# "chrome", "msedge", etc. — no Playwright install needed
+
 
 ### Add to Claude Code
 
 ```bash
-# Using bundled Chromium (default)
+# Using Playwright with bundled Chromium (default)
 claude mcp add --scope user amazon-shopping -- /path/to/amazon-shopping-mcp/.venv/bin/python -m amazon_mcp
 
-# Or to use a specific browser (e.g. Edge, Chrome):
+# Using Camoufox (anti-detect browser)
+claude mcp add --scope user -e AMAZON_BROWSER_BACKEND=camoufox amazon-shopping -- /path/to/amazon-shopping-mcp/.venv/bin/python -m amazon_mcp
+
+# Or using a specific Playwright browser (e.g. Edge, Chrome):
 claude mcp add --scope user -e BROWSER_CHANNEL=msedge amazon-shopping -- /path/to/amazon-shopping-mcp/.venv/bin/python -m amazon_mcp
 ```
 
@@ -92,11 +101,16 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "amazon-shopping": {
       "command": "/path/to/amazon-shopping-mcp/.venv/bin/python",
-      "args": ["-m", "amazon_mcp"]
+      "args": ["-m", "amazon_mcp"],
+      "env": {
+        "AMAZON_BROWSER_BACKEND": "camoufox"
+      }
     }
   }
 }
 ```
+*(Omit the `"env"` block if you want to use the default Playwright engine.)*
+
 
 ## Usage
 
@@ -142,10 +156,13 @@ Claude previews the order (items, ship-to, payment, total). Only when you confir
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `AMAZON_BROWSER_BACKEND` | `playwright` | Browser engine to use: `playwright` (Chromium) or `camoufox` (anti-detect Firefox) |
 | `AMAZON_DOMAIN` | `ca` | Default storefront for account/cart/checkout |
-| `AMAZON_USER_DATA_DIR` | `~/.amazon-mcp/user-data` | Where the logged-in browser profile is stored |
+| `AMAZON_USER_DATA_DIR` | `~/.amazon-mcp/user-data` (`.../camoufox` for Camoufox) | Where the logged-in browser profile is stored |
 | `AMAZON_HEADLESS` | `1` | Set `0` to watch the buying tools drive the browser (useful for debugging checkout) |
-| `BROWSER_CHANNEL` | _(unset)_ | Use an installed browser (`chrome`, `msedge`) instead of bundled Chromium |
+| `AMAZON_HUMAN_PAUSE` | `1` | Set `0` to disable the order-read pacing window |
+| `BROWSER_CHANNEL` | _(unset)_ | Use an installed browser (`chrome`, `msedge`) instead of bundled Chromium (Playwright only) |
+| `AMAZON_INVOICE_DIR` | `~/.amazon-mcp/invoices` | Private directory for downloaded invoices and printable order summaries |
 
 ### Parameters
 
@@ -160,6 +177,38 @@ Claude previews the order (items, ship-to, payment, total). Only when you confir
 **`amazon_product_reviews`**
 - `url` — Amazon product page URL
 - `max_reviews` — max reviews to return (default: 15)
+
+**`amazon_list_orders`**
+- `max_orders` — maximum orders to return (default: 10)
+- `year` — optional 4-digit year filter (e.g. `2024`)
+- `continuation_token` — token from a previous call to resume pagination
+- `domain` — Amazon domain suffix: `"ca"` (default), `"com"`, etc.
+- Scans order history with a 5-page budget per call, returning structured order summaries, `continuation_token`, and `stop_reason` (`target_reached`, `budget_exhausted`, `no_more_pages`, etc.).
+
+**`amazon_search_orders`**
+- `query` — search terms for past orders
+- `max_orders` — maximum matching orders to return (default: 10)
+- `domain` — Amazon domain suffix: `"ca"` (default), `"com"`, etc.
+- Uses Amazon's native order search form with a 5-page budget and continuation support.
+
+**`amazon_get_order`**
+- `order_number` — Amazon order number (e.g. `112-1234567-1234567`)
+- `domain` — Amazon domain suffix: `"ca"` (default), `"com"`, etc.
+- Retrieves direct details, scoped order card text (preserving line breaks), and labeled links.
+
+**`amazon_get_order_document`**
+- `order_number` — Amazon order number (e.g. `112-1234567-1234567`)
+- `domain` — Amazon domain suffix: `"com"` (default), `"ca"`, etc.
+- *Migration note:* Replaces `amazon_order_hsa_eligibility`. Rather than inferring HSA/FSA eligibility scopes or normalizing financial data with heuristic assumptions, this tool returns the raw visible text, displayed heading, and labeled links from Amazon's printable order summary or invoice document, leaving interpretation to the consumer.
+
+**`amazon_download_invoice`**
+- `order_number` — Amazon order number (e.g. `112-1234567-1234567`)
+- `domain` — Amazon domain suffix: `"ca"` (default), `"com"`, etc.
+- `output_format` — `"html"` (default) or `"pdf"`
+- Saves the printable document or invoice to `AMAZON_INVOICE_DIR` with private permissions (`0o600`). PDF rendering is supported on Chromium (Playwright backend); Camoufox currently returns an unsupported-format error due to upstream limitations ([daijro/camoufox#593](https://github.com/daijro/camoufox/issues/593)).
+
+**`amazon_reset_session`**
+- Takes no parameters. Closes active browser instances and releases application profile locks without clearing saved authentication credentials on disk.
 
 ## How It Works
 
