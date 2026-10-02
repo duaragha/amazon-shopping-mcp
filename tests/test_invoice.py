@@ -56,6 +56,24 @@ class DOMDocumentExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HSA or FSA eligible amount", result["body_text"])
         self.assertIn("$27.28", result["body_text"])
 
+        doc = OrderDocumentResult(
+            order_number="114-7654321-1234567",
+            heading=result.get("heading"),
+            title=result.get("title"),
+            document_type=result.get("document_type", "order_summary"),
+            body_text=result.get("body_text", ""),
+            source_url="https://www.amazon.com/gp/css/summary/print.html",
+        )
+        self.assertIsNotNone(doc.hsa_fsa)
+        self.assertTrue(doc.hsa_fsa.is_eligible)
+        self.assertEqual(doc.hsa_fsa.amount, "$27.28")
+        self.assertEqual(doc.hsa_fsa.amount_value, 27.28)
+        self.assertTrue(doc.hsa_fsa.includes_tax_and_shipping)
+        self.assertEqual(
+            doc.hsa_fsa.raw_text,
+            "HSA or FSA eligible amount (includes taxes & shipping): $27.28",
+        )
+
 
 class FakeDocumentPage:
     def __init__(self, doc_data, content_html="<html><body><h1>Test Doc</h1></body></html>"):
@@ -123,6 +141,40 @@ class OrderDocumentToolTests(_OrderPaceOff, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.document_type, "order_summary")
         self.assertIn("$45.99", res.body_text)
         self.assertEqual(len(res.links), 1)
+        self.assertIsNone(res.hsa_fsa)
+
+    async def test_fetches_printable_order_document_with_hsa_fsa(self):
+        page = FakeDocumentPage({
+            "heading": "Final Details for Order #114-7654321-1234567",
+            "title": "Amazon.com - Printable Order Summary",
+            "document_type": "order_summary",
+            "contains_order_number": True,
+            "unavailable": False,
+            "body_text": (
+                "Final Details for Order #114-7654321-1234567\n"
+                "Order Total: $45.99\n"
+                "HSA or FSA eligible amount (includes taxes & shipping): $27.28\n"
+                "1 of: Logitech Wireless Mouse\n"
+            ),
+            "links": [],
+        })
+
+        res: OrderDocumentResult = await fetch_order_document(
+            page=page,
+            order_number="114-7654321-1234567",
+            domain="com",
+            check_captcha_fn=AsyncMock(return_value=None),
+        )
+
+        self.assertIsNotNone(res.hsa_fsa)
+        self.assertTrue(res.hsa_fsa.is_eligible)
+        self.assertEqual(res.hsa_fsa.amount, "$27.28")
+        self.assertEqual(res.hsa_fsa.amount_value, 27.28)
+        self.assertTrue(res.hsa_fsa.includes_tax_and_shipping)
+        self.assertEqual(
+            res.hsa_fsa.raw_text,
+            "HSA or FSA eligible amount (includes taxes & shipping): $27.28",
+        )
 
     async def test_unavailable_document_raises_tool_error(self):
         page = FakeDocumentPage({

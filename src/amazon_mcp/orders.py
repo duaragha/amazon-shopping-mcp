@@ -14,11 +14,11 @@ from pathlib import Path
 import random
 import re
 import time
-from typing import Any
+from typing import Any, Self
 from urllib.parse import parse_qs, quote_plus, urlsplit
 
 from mcp.server.fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from playwright.async_api import Page
 
 from .browser import get_browser_backend
@@ -37,6 +37,72 @@ _DATE_PATTERN_RE = re.compile(
     r"\b(?:\d{1,2}\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})\b"
 )
 _PRODUCT_IMAGE_RE = re.compile(r"^https://m\.media-amazon\.com/images/I/", re.I)
+_HSA_FSA_LINE_RE = re.compile(
+    rf"(?P<label>\b(?:FSA\s*(?:or|/|&)\s*HSA|HSA\s*(?:or|/|&)\s*FSA|HSA|FSA)"
+    rf"[\s\-]eligible(?:\s+amount)?"
+    rf"(?:\s*\([^)]{{0,120}}\))?"
+    rf"\s*:\s*"
+    rf"(?:\s*\([^)]{{0,120}}\)\s*)?)"
+    rf"(?P<amount>{_MONEY_TOKEN_RE.pattern})",
+    re.IGNORECASE,
+)
+
+
+class HsaFsaEligibility(BaseModel):
+    """Structured HSA/FSA eligibility information."""
+
+    is_eligible: bool = Field(
+        description="Whether the order contains an HSA/FSA eligible amount (> $0) or is marked eligible"
+    )
+    amount: str | None = Field(
+        default=None,
+        description="Formatted eligible amount string, e.g. '$27.28'",
+    )
+    amount_value: float | None = Field(
+        default=None,
+        description="Numeric eligible amount as a float, e.g. 27.28",
+    )
+    includes_tax_and_shipping: bool | None = Field(
+        default=None,
+        description="Whether taxes and shipping are explicitly included in the eligible amount",
+    )
+    raw_text: str = Field(description="Displayed raw eligibility line from Amazon")
+
+
+def parse_hsa_fsa(text: str | None) -> HsaFsaEligibility | None:
+    """Parse HSA/FSA eligibility amount, status, and details from text."""
+    if not text:
+        return None
+    match = _HSA_FSA_LINE_RE.search(text)
+    if not match:
+        return None
+
+    raw_text = match.group(0).strip()
+    label = match.group("label") or ""
+    amount_str = match.group("amount").strip()
+    amount_val: float | None = None
+    num_match = re.search(r"[0-9]+(?:\.[0-9]{2})?", amount_str.replace(",", ""))
+    if num_match:
+        try:
+            amount_val = float(num_match.group(0))
+        except ValueError:
+            amount_val = None
+
+    is_eligible = amount_val is not None and amount_val > 0
+
+    inc_tax = (
+        bool(re.search(r"\btax", label, re.I) and re.search(r"\bshipping", label, re.I))
+        if label
+        else False
+    )
+
+    return HsaFsaEligibility(
+        is_eligible=is_eligible,
+        amount=amount_str,
+        amount_value=amount_val,
+        includes_tax_and_shipping=inc_tax,
+        raw_text=raw_text,
+    )
 
 # ---------------------------------------------------------------------------
 # Structured MCP Models
@@ -65,7 +131,20 @@ class OrderSummary(BaseModel):
     payment_method: str | None = Field(default=None, description="Displayed payment method or network, if present")
     seller: str | None = Field(default=None, description="Displayed seller information, if present")
     hsa_text: str | None = Field(default=None, description="Displayed HSA/FSA eligibility text, if present")
+    hsa_fsa: HsaFsaEligibility | None = Field(
+        default=None, description="Structured HSA/FSA eligibility details, if detected"
+    )
     returnable: bool = Field(default=False, description="Whether return or replacement options are displayed")
+
+    @model_validator(mode="after")
+    def _populate_hsa_fsa(self) -> Self:
+        if self.hsa_fsa is None and self.hsa_text:
+            self.hsa_fsa = parse_hsa_fsa(self.hsa_text)
+        elif self.hsa_fsa is None and self.card_text:
+            self.hsa_fsa = parse_hsa_fsa(self.card_text)
+            if self.hsa_fsa is not None and self.hsa_text is None:
+                self.hsa_text = self.hsa_fsa.raw_text
+        return self
 
 
 class OrderListResult(BaseModel):
@@ -99,6 +178,15 @@ class OrderDocumentResult(BaseModel):
     body_text: str = Field(description="Extracted visible text from the printable document")
     links: list[OrderLink] = Field(default_factory=list, description="Labeled links in the document")
     source_url: str = Field(description="Source URL of the printable document")
+    hsa_fsa: HsaFsaEligibility | None = Field(
+        default=None, description="Structured HSA/FSA eligibility details, if detected"
+    )
+
+    @model_validator(mode="after")
+    def _populate_hsa_fsa(self) -> Self:
+        if self.hsa_fsa is None and self.body_text:
+            self.hsa_fsa = parse_hsa_fsa(self.body_text)
+        return self
 
 
 class DownloadInvoiceResult(BaseModel):
@@ -114,6 +202,9 @@ class DownloadInvoiceResult(BaseModel):
     path: str = Field(description="Local file system path where the document was saved")
     size_bytes: int = Field(description="File size in bytes")
     source_url: str = Field(description="Source URL of the captured document")
+    hsa_fsa: HsaFsaEligibility | None = Field(
+        default=None, description="Structured HSA/FSA eligibility details, if detected"
+    )
 
 
 class ResetSessionResult(BaseModel):
@@ -304,10 +395,32 @@ SCRAPE_ORDERS_DOM_SCRIPT = """
 
         // HSA / FSA text if present on card
         let hsaText = null;
-        for (const line of cardText.split('\\n')) {
-            if (/\\b(?:hsa|fsa)\\b/i.test(line)) {
-                hsaText = clean(line);
-                break;
+        const hsaAmountPattern = /\\b(?:fsa\\s*(?:or|\\/|&)\\s*hsa|hsa\\s*(?:or|\\/|&)\\s*fsa|hsa|fsa)[\\s\\-]eligible(?:\\s+amount)?(?:\\s*\\([^)]{0,120}\\))?\\s*:(?:\\s*\\([^)]{0,120}\\))?\\s*(?:(?:US|CA|CDN)\\s*\\$|(?:USD|CAD)\\s*|\\$|£|€)?\\s*[0-9]/i;
+        const hsaLabelPattern = /\\b(?:fsa\\s*(?:or|\\/|&)\\s*hsa|hsa\\s*(?:or|\\/|&)\\s*fsa|hsa|fsa)[\\s\\-]eligible\\b/i;
+        const cardLines = cardText.split('\\n').map(l => clean(l)).filter(Boolean);
+
+        for (let i = 0; i < cardLines.length; i++) {
+            const line = cardLines[i];
+            if (/paying with|payment method|sold by:/i.test(line)) continue;
+            if (items.some(it => it && (it === line || line.includes(it)))) continue;
+
+            if (hsaLabelPattern.test(line)) {
+                let combined = line;
+                for (let j = i + 1; j < Math.min(cardLines.length, i + 3); j++) {
+                    const nextLine = cardLines[j];
+                    if (/^(?:\\([^)]+\\)|(?:(?:US|CA|CDN)\\s*\\$|(?:USD|CAD)\\s*|\\$|£|€)?\\s*[0-9])/i.test(nextLine)) {
+                        combined += ' ' + nextLine;
+                    } else {
+                        break;
+                    }
+                }
+                if (hsaAmountPattern.test(combined)) {
+                    hsaText = combined;
+                    break;
+                } else if (!hsaText && hsaAmountPattern.test(line)) {
+                    hsaText = line;
+                    break;
+                }
             }
         }
 
@@ -1043,4 +1156,5 @@ async def download_order_invoice(
         path=str(destination),
         size_bytes=destination.stat().st_size,
         source_url=doc_info.source_url,
+        hsa_fsa=doc_info.hsa_fsa,
     )

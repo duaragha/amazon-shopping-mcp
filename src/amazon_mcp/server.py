@@ -37,6 +37,7 @@ from .browser import (
 from .orders import (
     ORDER_NUMBER_RE,
     DownloadInvoiceResult,
+    HsaFsaEligibility,
     OrderDetailsResult,
     OrderDocumentResult,
     OrderListResult,
@@ -46,6 +47,7 @@ from .orders import (
     download_order_invoice,
     fetch_order_details,
     fetch_order_document,
+    parse_hsa_fsa,
 )
 
 # ---------------------------------------------------------------------------
@@ -1430,10 +1432,10 @@ async def amazon_get_order_document(
     order_number: str,
     domain: str = DEFAULT_DOMAIN,
 ) -> OrderDocumentResult:
-    """Extract visible content and heading from an order's printable document or summary.
+    """Extract visible content, heading, and structured HSA/FSA eligibility from an order's printable document.
 
-    Replaces heuristic HSA/FSA classification by returning the displayed document text,
-    labeled links, and document heading for consumer interpretation.
+    Returns the displayed document text, labeled links, document heading, and parsed
+    HSA/FSA eligibility details (`hsa_fsa`) when present on the document.
 
     After more than five order reads in 20 minutes, this call waits before loading,
     and every 15th read waits about one and a half to two and a half minutes.

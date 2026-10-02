@@ -8,6 +8,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from playwright.async_api import async_playwright
 
 from amazon_mcp.orders import (
+    HsaFsaEligibility,
     OrderDetailsResult,
     OrderListResult,
     OrderSummary,
@@ -20,6 +21,7 @@ from amazon_mcp.orders import (
     begin_order_action,
     collect_orders,
     fetch_order_details,
+    parse_hsa_fsa,
     reset_order_pace,
 )
 from amazon_mcp.server import (
@@ -830,6 +832,250 @@ class OrderPaceCollectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.wait_for_timeout.await_count, 1)
         self.assertGreaterEqual(wait_ms, int(PACE_LONG_MIN_S * 1000))
         self.assertLessEqual(wait_ms, int(PACE_LONG_MAX_S * 1000))
+
+
+class HsaFsaEligibilityUnitTests(unittest.TestCase):
+    """Unit tests for parse_hsa_fsa parsing and classification."""
+
+    def test_parses_hsa_fsa_with_taxes_and_shipping(self):
+        res = parse_hsa_fsa(
+            "HSA or FSA eligible amount (includes taxes & shipping): $27.28"
+        )
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_eligible)
+        self.assertEqual(res.amount, "$27.28")
+        self.assertEqual(res.amount_value, 27.28)
+        self.assertTrue(res.includes_tax_and_shipping)
+        self.assertEqual(
+            res.raw_text,
+            "HSA or FSA eligible amount (includes taxes & shipping): $27.28",
+        )
+
+    def test_parses_fsa_or_hsa_ordering(self):
+        res = parse_hsa_fsa(
+            "Grand Total: $120.00\nFSA or HSA eligible amount: $45.50"
+        )
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_eligible)
+        self.assertEqual(res.amount, "$45.50")
+        self.assertEqual(res.amount_value, 45.50)
+        self.assertFalse(res.includes_tax_and_shipping)
+        self.assertEqual(res.raw_text, "FSA or HSA eligible amount: $45.50")
+
+    def test_parses_explicit_zero_as_not_eligible(self):
+        res = parse_hsa_fsa("HSA/FSA eligible amount: $0.00")
+        self.assertIsNotNone(res)
+        self.assertFalse(res.is_eligible)
+        self.assertEqual(res.amount, "$0.00")
+        self.assertEqual(res.amount_value, 0.0)
+        self.assertFalse(res.includes_tax_and_shipping)
+
+    def test_parses_currency_variants(self):
+        us_res = parse_hsa_fsa("HSA/FSA eligible (inc. tax and shipping): US$ 12.00")
+        self.assertIsNotNone(us_res)
+        self.assertTrue(us_res.is_eligible)
+        self.assertEqual(us_res.amount, "US$ 12.00")
+        self.assertEqual(us_res.amount_value, 12.0)
+        self.assertTrue(us_res.includes_tax_and_shipping)
+
+        cad_res = parse_hsa_fsa("HSA / FSA eligible amount: CDN$ 25.00")
+        self.assertIsNotNone(cad_res)
+        self.assertTrue(cad_res.is_eligible)
+        self.assertEqual(cad_res.amount, "CDN$ 25.00")
+        self.assertEqual(cad_res.amount_value, 25.0)
+
+    def test_ignores_labels_without_amount(self):
+        self.assertIsNone(parse_hsa_fsa("Item is HSA or FSA eligible"))
+        self.assertIsNone(parse_hsa_fsa("First Aid Rolled Gauze (HSA/FSA Eligible)"))
+
+    def test_ignores_unrelated_text_and_payment_methods(self):
+        self.assertIsNone(parse_hsa_fsa("Paying with Visa 1234"))
+        self.assertIsNone(parse_hsa_fsa("Paying with HSA debit card 5678"))
+        self.assertIsNone(parse_hsa_fsa("Sold by: FSA Direct Supplies"))
+        self.assertIsNone(parse_hsa_fsa("Logitech Wireless Mouse"))
+        self.assertIsNone(parse_hsa_fsa(None))
+        self.assertIsNone(parse_hsa_fsa(""))
+
+
+class OrderSummaryHsaFsaTests(unittest.IsolatedAsyncioTestCase):
+    """Tests HSA/FSA extraction on order cards in SCRAPE_ORDERS_DOM_SCRIPT and OrderSummary."""
+
+    async def asyncSetUp(self):
+        self.pw = await async_playwright().start()
+        self.browser = await self.pw.chromium.launch(headless=True)
+        self.page = await self.browser.new_page()
+
+    async def asyncTearDown(self):
+        await self.page.close()
+        await self.browser.close()
+        await self.pw.stop()
+
+    async def test_order_summary_structured_hsa_from_standard_fixture(self):
+        html = _read_fixture("orders_standard.html")
+        await self.page.set_content(html)
+        result = await self.page.evaluate(SCRAPE_ORDERS_DOM_SCRIPT)
+        orders = result["orders"]
+
+        # Order 1 has no HSA info
+        o1 = OrderSummary(**orders[0])
+        self.assertIsNone(o1.hsa_text)
+        self.assertIsNone(o1.hsa_fsa)
+
+        # Order 2 has explicit $0.00
+        o2 = OrderSummary(**orders[1])
+        self.assertEqual(o2.hsa_text, "HSA/FSA eligible amount: $0.00")
+        self.assertIsNotNone(o2.hsa_fsa)
+        self.assertFalse(o2.hsa_fsa.is_eligible)
+        self.assertEqual(o2.hsa_fsa.amount, "$0.00")
+        self.assertEqual(o2.hsa_fsa.amount_value, 0.0)
+
+    async def test_product_title_with_fsa_does_not_hijack_hsa_text(self):
+        html = """
+        <html><body>
+          <div id="ordersContainer">
+            <div class="order-card" data-component-type="orderCard">
+              <span class="yohtmlc-order-id">111-2222222-3333333</span>
+              <div class="item">
+                <a class="yohtmlc-product-title" href="/dp/B001">First Aid Rolled Gauze (HSA/FSA Eligible)</a>
+              </div>
+              <div>Paying with Visa 1234</div>
+            </div>
+          </div>
+        </body></html>
+        """
+        await self.page.set_content(html)
+        result = await self.page.evaluate(SCRAPE_ORDERS_DOM_SCRIPT)
+        order_data = result["orders"][0]
+
+        summary = OrderSummary(**order_data)
+        self.assertIsNone(summary.hsa_text)
+        self.assertIsNone(summary.hsa_fsa)
+
+    async def test_order_level_hsa_selected_over_product_title(self):
+        html = """
+        <html><body>
+          <div id="ordersContainer">
+            <div class="order-card" data-component-type="orderCard">
+              <span class="yohtmlc-order-id">111-2222222-3333333</span>
+              <div class="item">
+                <a class="yohtmlc-product-title" href="/dp/B001">First Aid Rolled Gauze (HSA/FSA Eligible)</a>
+              </div>
+              <div class="meta">
+                <div>HSA or FSA eligible amount (includes taxes & shipping): $19.99</div>
+              </div>
+            </div>
+          </div>
+        </body></html>
+        """
+        await self.page.set_content(html)
+        result = await self.page.evaluate(SCRAPE_ORDERS_DOM_SCRIPT)
+        order_data = result["orders"][0]
+
+        summary = OrderSummary(**order_data)
+        self.assertEqual(
+            summary.hsa_text,
+            "HSA or FSA eligible amount (includes taxes & shipping): $19.99",
+        )
+        self.assertIsNotNone(summary.hsa_fsa)
+        self.assertTrue(summary.hsa_fsa.is_eligible)
+        self.assertEqual(summary.hsa_fsa.amount, "$19.99")
+        self.assertEqual(summary.hsa_fsa.amount_value, 19.99)
+        self.assertTrue(summary.hsa_fsa.includes_tax_and_shipping)
+
+    async def test_collect_orders_handful_mixed_hsa_eligibility(self):
+        page_html = """
+        <html><body>
+          <div id="ordersContainer">
+            <!-- Order 1: No HSA info -->
+            <div class="order-card" data-component-type="orderCard">
+              <span class="yohtmlc-order-id">111-1111111-1111111</span>
+              <div class="item">
+                <a class="yohtmlc-product-title" href="/dp/B001">USB-C Hub Multiport Adapter</a>
+              </div>
+              <div>Paying with Visa 1111</div>
+            </div>
+
+            <!-- Order 2: Explicit $0.00 HSA/FSA amount -->
+            <div class="order-card" data-component-type="orderCard">
+              <span class="yohtmlc-order-id">111-2222222-2222222</span>
+              <div class="item">
+                <a class="yohtmlc-product-title" href="/dp/B002">Wireless Ergonomic Mouse</a>
+              </div>
+              <div class="meta">
+                <div>Paying with Mastercard 2222</div>
+                <div>HSA/FSA eligible amount: $0.00</div>
+              </div>
+            </div>
+
+            <!-- Order 3: Positive HSA/FSA eligible amount -->
+            <div class="order-card" data-component-type="orderCard">
+              <span class="yohtmlc-order-id">111-3333333-3333333</span>
+              <div class="item">
+                <a class="yohtmlc-product-title" href="/dp/B003">Digital Infrared Thermometer</a>
+              </div>
+              <div class="meta">
+                <div>HSA or FSA eligible amount (includes taxes & shipping): $34.50</div>
+              </div>
+            </div>
+
+            <!-- Order 4: Product title with HSA/FSA tag, no card-level amount -->
+            <div class="order-card" data-component-type="orderCard">
+              <span class="yohtmlc-order-id">111-4444444-4444444</span>
+              <div class="item">
+                <a class="yohtmlc-product-title" href="/dp/B004">Saline Nasal Spray (HSA/FSA Eligible)</a>
+              </div>
+              <div>Paying with Visa 4444</div>
+            </div>
+          </div>
+        </body></html>
+        """
+        await self.page.set_content(page_html)
+        dom_data = await self.page.evaluate(SCRAPE_ORDERS_DOM_SCRIPT)
+
+        # Feed DOM scrape results through collect_orders via FakePageForOrders
+        fake_page = FakePageForOrders([dom_data])
+        res: OrderListResult = await collect_orders(
+            page=fake_page,
+            start_url="https://www.amazon.ca/your-orders/orders",
+            max_orders=10,
+            check_captcha_fn=AsyncMock(return_value=None),
+            account_name_fn=AsyncMock(return_value="Test User"),
+            is_logged_in_fn=lambda name: True,
+        )
+
+        self.assertEqual(res.count, 4)
+        orders_by_id = {o.order_number: o for o in res.orders}
+
+        # 1. Without HSA
+        o1 = orders_by_id["111-1111111-1111111"]
+        self.assertIsNone(o1.hsa_text)
+        self.assertIsNone(o1.hsa_fsa)
+
+        # 2. $0.00 HSA
+        o2 = orders_by_id["111-2222222-2222222"]
+        self.assertEqual(o2.hsa_text, "HSA/FSA eligible amount: $0.00")
+        self.assertIsNotNone(o2.hsa_fsa)
+        self.assertFalse(o2.hsa_fsa.is_eligible)
+        self.assertEqual(o2.hsa_fsa.amount, "$0.00")
+        self.assertEqual(o2.hsa_fsa.amount_value, 0.0)
+        self.assertFalse(o2.hsa_fsa.includes_tax_and_shipping)
+
+        # 3. Positive $34.50 HSA
+        o3 = orders_by_id["111-3333333-3333333"]
+        self.assertEqual(
+            o3.hsa_text,
+            "HSA or FSA eligible amount (includes taxes & shipping): $34.50",
+        )
+        self.assertIsNotNone(o3.hsa_fsa)
+        self.assertTrue(o3.hsa_fsa.is_eligible)
+        self.assertEqual(o3.hsa_fsa.amount, "$34.50")
+        self.assertEqual(o3.hsa_fsa.amount_value, 34.50)
+        self.assertTrue(o3.hsa_fsa.includes_tax_and_shipping)
+
+        # 4. Product title with (HSA/FSA Eligible) but no card amount
+        o4 = orders_by_id["111-4444444-4444444"]
+        self.assertIsNone(o4.hsa_text)
+        self.assertIsNone(o4.hsa_fsa)
 
 
 if __name__ == "__main__":

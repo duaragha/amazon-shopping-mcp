@@ -44,7 +44,7 @@ Built with Playwright for reliable browsing that doesn't get blocked like simple
 | `amazon_list_orders` | List orders across paginated and yearly history with a 5-page budget, continuation token, and stop reason |
 | `amazon_search_orders` | Search past orders by keyword using Amazon's order search form |
 | `amazon_get_order` | Fetch direct details, scoped card text, and labeled links for a specific order number |
-| `amazon_get_order_document` | Extract visible text, labeled links, and heading from an order's printable summary or invoice document (replaces `amazon_order_hsa_eligibility`) |
+| `amazon_get_order_document` | Extract visible text, labeled links, heading, and structured HSA/FSA eligibility from an order's printable summary or invoice document |
 | `amazon_download_invoice` | Save an order's invoice or printable summary as HTML (default) or rendered PDF (Chromium), with private file permissions |
 | `amazon_view_returns` | List in-progress / past returns with their status (from the returns-filtered order history) |
 | `amazon_start_return` | Open the return wizard for an order. Default = **preview only** (returnable items + reason options); `confirm=true` to submit |
@@ -198,8 +198,7 @@ Claude previews the order (items, ship-to, payment, total). Only when you confir
 
 **`amazon_get_order_document`**
 - `order_number` — Amazon order number (e.g. `112-1234567-1234567`)
-- `domain` — Amazon domain suffix: `"com"` (default), `"ca"`, etc.
-- *Migration note:* Replaces `amazon_order_hsa_eligibility`. Rather than inferring HSA/FSA eligibility scopes or normalizing financial data with heuristic assumptions, this tool returns the raw visible text, displayed heading, and labeled links from Amazon's printable order summary or invoice document, leaving interpretation to the consumer.
+- Extracts raw visible text, displayed heading, labeled links, and parsed structured HSA/FSA eligibility (`hsa_fsa` with boolean `is_eligible`, formatted `amount`, float `amount_value`, and `includes_tax_and_shipping`) from Amazon's printable order summary or invoice document.
 
 **`amazon_download_invoice`**
 - `order_number` — Amazon order number (e.g. `112-1234567-1234567`)
