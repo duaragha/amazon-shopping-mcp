@@ -14,134 +14,74 @@ import asyncio
 import json
 import os
 import re
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from mcp.server.fastmcp import FastMCP
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from mcp.server.fastmcp.exceptions import ToolError
+from playwright.async_api import Page
+
+from .browser import (
+    BROWSER_BACKEND,
+    HEADLESS,
+    USER_DATA_DIR,
+    authenticated_lock,
+    close_logged_in_context,
+    create_page,
+    get_browser,
+    get_browser_backend,
+    get_logged_in_context,
+    reset_session,
+)
+from .orders import (
+    ORDER_NUMBER_RE,
+    DownloadInvoiceResult,
+    HsaFsaEligibility,
+    OrderDetailsResult,
+    OrderDocumentResult,
+    OrderListResult,
+    OrderSummary,
+    ResetSessionResult,
+    collect_orders,
+    download_order_invoice,
+    fetch_order_details,
+    fetch_order_document,
+    parse_hsa_fsa,
+)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-# Where the logged-in Chromium profile (cookies/session) lives on disk.
-USER_DATA_DIR = os.environ.get(
-    "AMAZON_USER_DATA_DIR", os.path.expanduser("~/.amazon-mcp/user-data")
-)
 # Default storefront for account/cart/checkout flows.
 DEFAULT_DOMAIN = os.environ.get("AMAZON_DOMAIN", "ca")
-# Run the logged-in context headless. Login itself is always headful.
-HEADLESS = os.environ.get("AMAZON_HEADLESS", "1") != "0"
-
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-)
-_MEDIA_RE = re.compile(
-    r"\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|mp4|webm)(\?|$)", re.I
+# Downloaded order documents contain names, addresses, and purchase details. Keep
+# them in the server's private state directory unless the operator opts into a
+# different location.
+INVOICE_DIR = os.environ.get(
+    "AMAZON_INVOICE_DIR", os.path.expanduser("~/.amazon-mcp/invoices")
 )
 
-# ---------------------------------------------------------------------------
-# Browser management
-# ---------------------------------------------------------------------------
-
-_browser: Browser | None = None
-_pw = None
-
-
-async def get_browser() -> Browser:
-    global _browser, _pw
-    if _browser is None or not _browser.is_connected():
-        _pw = await async_playwright().start()
-        channel = os.environ.get("BROWSER_CHANNEL")  # e.g. "msedge", "chrome"
-        _browser = await _pw.chromium.launch(
-            **({"channel": channel} if channel else {}),
-            headless=True,
-        )
-    return _browser
-
-
-async def create_page(block_media: bool = False) -> Page:
-    browser = await get_browser()
-    context = await browser.new_context(
-        user_agent=_USER_AGENT,
-        viewport={"width": 1920, "height": 1080},
-        locale="en-CA",
-    )
-    if block_media:
-        await context.route(_MEDIA_RE, lambda route: route.abort())
-    page = await context.new_page()
-    return page
-
-
-# ---------------------------------------------------------------------------
-# Persistent logged-in context (for account / cart / checkout)
-# ---------------------------------------------------------------------------
-
-_ctx: BrowserContext | None = None
-_ctx_pw = None
-
-
-async def get_logged_in_context(headless: bool | None = None) -> BrowserContext:
-    """Return the persistent, logged-in browser context (launching it if needed).
-
-    All pages share the same cookies/session, persisted under USER_DATA_DIR.
-    """
-    global _ctx, _ctx_pw
-    if _ctx is not None:
-        return _ctx
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-    if _ctx_pw is None:
-        _ctx_pw = await async_playwright().start()
-    channel = os.environ.get("BROWSER_CHANNEL")
-    kwargs = {
-        "headless": HEADLESS if headless is None else headless,
-        "user_agent": _USER_AGENT,
-        "viewport": {"width": 1920, "height": 1080},
-        "locale": "en-CA",
-        # Anti-bot: drop the most obvious headless/automation tells. Pairs with the
-        # init script below. The real-profile cookies do most of the trust-building;
-        # this stops Amazon's fingerprinter from flagging the automation flags.
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-    }
-    if channel:
-        kwargs["channel"] = channel
-    _ctx = await _ctx_pw.chromium.launch_persistent_context(USER_DATA_DIR, **kwargs)
-    # Mask the leftover webdriver/automation signals before any page script runs.
-    await _ctx.add_init_script(
-        """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-CA', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = window.chrome || { runtime: {} };
-        """
-    )
-    # No logged-in flow needs images/fonts/video — drop them for speed.
-    await _ctx.route(_MEDIA_RE, lambda route: route.abort())
-    return _ctx
-
-
-async def close_logged_in_context() -> None:
-    """Close the persistent context, flushing the session profile to disk.
-
-    The Chromium profile is locked while open, so login (which needs a second,
-    headful window on the same profile) must close it first; the next call to
-    get_logged_in_context() transparently reopens it.
-    """
-    global _ctx, _ctx_pw
-    if _ctx is not None:
-        try:
-            await _ctx.close()
-        finally:
-            _ctx = None
-    if _ctx_pw is not None:
-        try:
-            await _ctx_pw.stop()
-        finally:
-            _ctx_pw = None
+# Product images are the only blocked media needed in a printable order summary.
+# Allowing the much broader media pattern made Amazon's decorative assets slow
+# document export dramatically.
+_PRODUCT_IMAGE_RE = re.compile(r"^https://m\.media-amazon\.com/images/I/", re.I)
+_ORDER_NUMBER_RE = re.compile(r"^D?\d{2,3}-\d{7}-\d{7}$")
+_MONEY_TOKEN = (
+    r"(?:(?:US|CA|CDN)\s*\$|(?:USD|CAD)\s*|\$|£|€)\s*"
+    r"[0-9][0-9,]*(?:\.[0-9]{2})?"
+)
+_HSA_FSA_AMOUNT_RE = re.compile(
+    rf"(?P<label>\b(?:FSA\s*(?:or|/|&)\s*HSA|HSA\s*(?:or|/|&)\s*FSA)"
+    rf"\s+eligible(?:\s+amount)?(?:\s*\([^)]{{0,120}}\))?)"
+    rf"\s*:\s*(?P<amount>{_MONEY_TOKEN})",
+    re.I,
+)
+_ORDER_TOTAL_RE = re.compile(
+    rf"\b(?:Grand|Order)\s+Total\s*:\s*(?P<amount>{_MONEY_TOKEN})",
+    re.I,
+)
 
 
 async def _account_name(page: Page) -> str | None:
@@ -263,7 +203,9 @@ async def amazon_search(
             return json.dumps({"error": captcha})
 
         await page.wait_for_selector(
-            'div[data-component-type="s-search-result"]', timeout=10000
+            'div[data-component-type="s-search-result"]',
+            state="attached",
+            timeout=10000,
         )
 
         results = await page.evaluate(
@@ -683,78 +625,84 @@ async def amazon_login_status(domain: str = DEFAULT_DOMAIN) -> str:
     Args:
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/", wait_until="domcontentloaded", timeout=30000
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        return json.dumps(
-            {
-                "logged_in": _is_logged_in(name),
-                "account": name if _is_logged_in(name) else None,
-                "hint": None
-                if _is_logged_in(name)
-                else "Run amazon_login to sign in (opens a real browser window).",
-            }
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                f"https://www.amazon.{domain}/", wait_until="domcontentloaded", timeout=30000
+            )
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            return json.dumps(
+                {
+                    "logged_in": _is_logged_in(name),
+                    "account": name if _is_logged_in(name) else None,
+                    "hint": None
+                    if _is_logged_in(name)
+                    else "Run amazon_login to sign in (opens a real browser window).",
+                }
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
 async def amazon_login(domain: str = DEFAULT_DOMAIN, timeout_seconds: int = 240) -> str:
-    """Open a real (visible) browser window so you can sign in to Amazon by hand.
+    """Open a visible browser and block until the user finishes signing in.
 
-    Handles password + 2FA / OTP manually — those can't and shouldn't be
-    automated. Once you're signed in, the session is saved to disk and every
-    other buying tool reuses it; you won't need to log in again until it expires.
+    Before calling this, tell the user a browser window is about to open and
+    that they must complete Amazon sign-in in that window, including password
+    and 2FA. This call then waits up to timeout_seconds (default 240) and
+    accepts no further messages until it returns. Do not call it until the
+    user knows the window is theirs to use.
+
+    The server never types credentials. After a successful sign-in the session
+    is saved to disk and reused by the other account tools.
 
     Args:
         domain: Amazon domain — "ca" for Canada, "com" for US.
-        timeout_seconds: How long to wait for you to finish logging in.
+        timeout_seconds: How long to wait for the user to finish signing in.
     """
-    # A headful login window needs exclusive use of the profile dir, so release
-    # any headless context first.
-    await close_logged_in_context()
-    ctx = await get_logged_in_context(headless=False)
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/gp/sign-in.html",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        waited = 0
-        while waited < timeout_seconds:
-            try:
-                name = await _account_name(page)
-            except Exception:
-                name = None
-            if _is_logged_in(name):
-                await close_logged_in_context()  # flush cookies to disk
-                return json.dumps(
-                    {"logged_in": True, "account": name, "message": "Signed in. Session saved."}
-                )
-            await page.wait_for_timeout(3000)
-            waited += 3
+    async with authenticated_lock():
+        # A headful login window needs exclusive use of the profile dir, so release
+        # any headless context first.
         await close_logged_in_context()
-        return json.dumps(
-            {
-                "logged_in": False,
-                "error": f"Did not detect a completed login within {timeout_seconds}s. "
-                "Run amazon_login again and finish signing in.",
-            }
-        )
-    except Exception as e:
-        await close_logged_in_context()
-        return json.dumps({"error": str(e)})
+        ctx = await get_logged_in_context(headless=False)
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                f"https://www.amazon.{domain}/gp/sign-in.html",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            waited = 0
+            while waited < timeout_seconds:
+                try:
+                    name = await _account_name(page)
+                except Exception:
+                    name = None
+                if _is_logged_in(name):
+                    return json.dumps(
+                        {"logged_in": True, "account": name, "message": "Signed in. Session saved."}
+                    )
+                await page.wait_for_timeout(3000)
+                waited += 3
+            return json.dumps(
+                {
+                    "logged_in": False,
+                    "error": f"Did not detect a completed login within {timeout_seconds}s. "
+                    "Run amazon_login again and finish signing in.",
+                }
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await close_logged_in_context()
 
 
 @mcp.tool()
@@ -767,73 +715,74 @@ async def amazon_list_addresses(domain: str = DEFAULT_DOMAIN) -> str:
     Args:
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/a/addresses",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                f"https://www.amazon.{domain}/a/addresses",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
 
-        addresses = await page.evaluate(
-            """
-            () => {
-                const out = [];
-                const cards = document.querySelectorAll(
-                    '.address-book-entry, [class*="address-tile"], li.a-spacing-base .a-box-inner'
-                );
-                cards.forEach(card => {
-                    const isDefault = !!card.querySelector(
-                        '[class*="default"], .a-color-success'
+            addresses = await page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const cards = document.querySelectorAll(
+                        '.address-book-entry, [class*="address-tile"], li.a-spacing-base .a-box-inner'
                     );
-                    const lines = Array.from(
-                        card.querySelectorAll('.a-row, li, div')
-                    )
-                        .map(el => el.childNodes.length &&
-                            el.querySelector('.a-row, li, div')
-                                ? '' : (el.textContent || '').trim())
-                        .filter(Boolean);
-                    const text = card.innerText
-                        ? card.innerText.replace(/\\s*\\n\\s*/g, ', ').trim()
-                        : lines.join(', ');
-                    if (text && text.length > 5 &&
-                        !/^Add address/i.test(text)) {
-                        out.push({ text, default: isDefault });
-                    }
-                });
-                // Dedupe by text.
-                const seen = new Set();
-                return out.filter(a => {
-                    if (seen.has(a.text)) return false;
-                    seen.add(a.text);
-                    return true;
-                });
-            }
-            """
-        )
-        for i, a in enumerate(addresses):
-            a["index"] = i
-        return json.dumps(
-            {
-                "count": len(addresses),
-                "addresses": addresses,
-                "note": "Pass `index` (or distinctive text) as address_hint to amazon_place_order."
-                if addresses
-                else "No addresses parsed — Amazon may have changed its layout. Try amazon_login again.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+                    cards.forEach(card => {
+                        const isDefault = !!card.querySelector(
+                            '[class*="default"], .a-color-success'
+                        );
+                        const lines = Array.from(
+                            card.querySelectorAll('.a-row, li, div')
+                        )
+                            .map(el => el.childNodes.length &&
+                                el.querySelector('.a-row, li, div')
+                                    ? '' : (el.textContent || '').trim())
+                            .filter(Boolean);
+                        const text = card.innerText
+                            ? card.innerText.replace(/\\s*\\n\\s*/g, ', ').trim()
+                            : lines.join(', ');
+                        if (text && text.length > 5 &&
+                            !/^Add address/i.test(text)) {
+                            out.push({ text, default: isDefault });
+                        }
+                    });
+                    // Dedupe by text.
+                    const seen = new Set();
+                    return out.filter(a => {
+                        if (seen.has(a.text)) return false;
+                        seen.add(a.text);
+                        return true;
+                    });
+                }
+                """
+            )
+            for i, a in enumerate(addresses):
+                a["index"] = i
+            return json.dumps(
+                {
+                    "count": len(addresses),
+                    "addresses": addresses,
+                    "note": "Pass `index` (or distinctive text) as address_hint to amazon_place_order."
+                    if addresses
+                    else "No addresses parsed — Amazon may have changed its layout. Try amazon_login again.",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
@@ -846,70 +795,71 @@ async def amazon_list_payment_methods(domain: str = DEFAULT_DOMAIN) -> str:
     Args:
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/cpe/yourpayments/wallet",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                f"https://www.amazon.{domain}/cpe/yourpayments/wallet",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
 
-        cards = await page.evaluate(
-            """
-            () => {
-                const out = [];
-                const tiles = document.querySelectorAll(
-                    '.pmts-wallet-tab-content .a-box, [class*="instrument"], .pmts-payments-instrument-details'
-                );
-                tiles.forEach(t => {
-                    const txt = (t.innerText || '').trim();
-                    if (!txt) return;
-                    const last4 = (txt.match(/(?:ending in|\\*{2,}\\s*|••••\\s*)(\\d{4})/i)
-                        || txt.match(/(\\d{4})(?!.*\\d{4})/));
-                    const expiry = txt.match(/(0?[1-9]|1[0-2])\\s*\\/\\s*(\\d{2,4})/);
-                    const network = (txt.match(/\\b(Visa|Mastercard|Amex|American Express|Discover)\\b/i) || [])[0];
-                    if (last4 || network) {
-                        out.push({
-                            last4: last4 ? last4[1] : null,
-                            network: network || null,
-                            expiry: expiry ? expiry[0] : null,
-                            label: txt.replace(/\\s*\\n\\s*/g, ' ').slice(0, 120),
-                        });
-                    }
-                });
-                const seen = new Set();
-                return out.filter(c => {
-                    const k = (c.network || '') + (c.last4 || '');
-                    if (seen.has(k)) return false;
-                    seen.add(k);
-                    return true;
-                });
-            }
-            """
-        )
-        for i, c in enumerate(cards):
-            c["index"] = i
-        return json.dumps(
-            {
-                "count": len(cards),
-                "payment_methods": cards,
-                "note": "Pass `index` (or e.g. 'Visa 1234') as payment_hint to amazon_place_order."
-                if cards
-                else "No cards parsed — Amazon may have changed its layout, or your wallet is empty.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+            cards = await page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const tiles = document.querySelectorAll(
+                        '.pmts-wallet-tab-content .a-box, [class*="instrument"], .pmts-payments-instrument-details'
+                    );
+                    tiles.forEach(t => {
+                        const txt = (t.innerText || '').trim();
+                        if (!txt) return;
+                        const last4 = (txt.match(/(?:ending in|\\*{2,}\\s*|••••\\s*)(\\d{4})/i)
+                            || txt.match(/(\\d{4})(?!.*\\d{4})/));
+                        const expiry = txt.match(/(0?[1-9]|1[0-2])\\s*\\/\\s*(\\d{2,4})/);
+                        const network = (txt.match(/\\b(Visa|Mastercard|Amex|American Express|Discover)\\b/i) || [])[0];
+                        if (last4 || network) {
+                            out.push({
+                                last4: last4 ? last4[1] : null,
+                                network: network || null,
+                                expiry: expiry ? expiry[0] : null,
+                                label: txt.replace(/\\s*\\n\\s*/g, ' ').slice(0, 120),
+                            });
+                        }
+                    });
+                    const seen = new Set();
+                    return out.filter(c => {
+                        const k = (c.network || '') + (c.last4 || '');
+                        if (seen.has(k)) return false;
+                        seen.add(k);
+                        return true;
+                    });
+                }
+                """
+            )
+            for i, c in enumerate(cards):
+                c["index"] = i
+            return json.dumps(
+                {
+                    "count": len(cards),
+                    "payment_methods": cards,
+                    "note": "Pass `index` (or e.g. 'Visa 1234') as payment_hint to amazon_place_order."
+                    if cards
+                    else "No cards parsed — Amazon may have changed its layout, or your wallet is empty.",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
@@ -932,61 +882,62 @@ async def amazon_add_to_cart(
     if not url:
         url = f"https://www.amazon.{domain}/dp/{asin}"
 
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
 
-        title = await page.query_selector("#productTitle")
-        title_text = (await title.inner_text()).strip() if title else None
+            title = await page.query_selector("#productTitle")
+            title_text = (await title.inner_text()).strip() if title else None
 
-        if quantity and quantity > 1:
-            try:
-                await page.select_option("#quantity", str(quantity), timeout=3000)
-            except Exception:
-                pass  # some listings have no quantity selector
+            if quantity and quantity > 1:
+                try:
+                    await page.select_option("#quantity", str(quantity), timeout=3000)
+                except Exception:
+                    pass  # some listings have no quantity selector
 
-        atc = await page.query_selector("#add-to-cart-button")
-        offer_used = None
-        if atc:
-            await atc.click()
-        else:
-            # No featured buy box — the item sells via "See all buying options".
-            # Open the offers panel and add the first (top / cheapest-shown) offer.
-            offer_used = await _add_via_buying_options(page)
-            if not offer_used:
-                avail = await page.query_selector("#availability")
-                msg = (await avail.inner_text()).strip() if avail else "unknown"
-                return json.dumps(
-                    {
-                        "error": "No add-to-cart button and no buyable offer found "
-                        "(item may be unavailable or seller-restricted).",
-                        "availability": msg,
-                        "url": url,
-                    }
-                )
-        await page.wait_for_timeout(1500)
-        await _dismiss_popups(page)
+            atc = await page.query_selector("#add-to-cart-button")
+            offer_used = None
+            if atc:
+                await atc.click()
+            else:
+                # No featured buy box — the item sells via "See all buying options".
+                # Open the offers panel and add the first (top / cheapest-shown) offer.
+                offer_used = await _add_via_buying_options(page)
+                if not offer_used:
+                    avail = await page.query_selector("#availability")
+                    msg = (await avail.inner_text()).strip() if avail else "unknown"
+                    return json.dumps(
+                        {
+                            "error": "No add-to-cart button and no buyable offer found "
+                            "(item may be unavailable or seller-restricted).",
+                            "availability": msg,
+                            "url": url,
+                        }
+                    )
+            await page.wait_for_timeout(1500)
+            await _dismiss_popups(page)
 
-        count_el = await page.query_selector("#nav-cart-count")
-        cart_count = (await count_el.inner_text()).strip() if count_el else None
-        return json.dumps(
-            {
-                "added": True,
-                "title": title_text,
-                "quantity": quantity,
-                "via": offer_used or "buy box",
-                "cart_count": cart_count,
-                "url": url,
-            }
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e), "url": url})
-    finally:
-        await page.close()
+            count_el = await page.query_selector("#nav-cart-count")
+            cart_count = (await count_el.inner_text()).strip() if count_el else None
+            return json.dumps(
+                {
+                    "added": True,
+                    "title": title_text,
+                    "quantity": quantity,
+                    "via": offer_used or "buy box",
+                    "cart_count": cart_count,
+                    "url": url,
+                }
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e), "url": url})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
@@ -996,85 +947,86 @@ async def amazon_view_cart(domain: str = DEFAULT_DOMAIN) -> str:
     Args:
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/gp/cart/view.html",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                f"https://www.amazon.{domain}/gp/cart/view.html",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
 
-        data = await page.evaluate(
-            """
-            () => {
-                // Scope strictly to the active-cart container so we don't pick up
-                // "Saved for later" rows or recommendation/"buy again" carousels.
-                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                // #activeCartViewForm reliably wraps ONLY the active line items
-                // (not "saved for later" or recommendation carousels).
-                const root =
-                    document.querySelector('#activeCartViewForm') ||
-                    document.querySelector('#sc-active-cart') ||
-                    document.querySelector('[data-name="Active Items"]');
-                const items = [];
-                if (root) {
-                    // Each line item is a .sc-list-item; its ASIN sits on the element
-                    // OR a descendant — don't require it on the element itself
-                    // (that was the bug that made this enumerate ~1 of N).
-                    root.querySelectorAll('.sc-list-item').forEach(it => {
-                        const title = clean(it.querySelector(
-                            '.sc-product-title, .a-truncate-cut, .sc-grid-item-product-title, [data-feature-id="item-title"]'
-                        )?.textContent);
-                        if (!title) return;
-                        const asin = it.getAttribute('data-asin')
-                            || it.querySelector('[data-asin]')?.getAttribute('data-asin')
-                            || null;
-                        const price = clean(it.querySelector(
-                            '.sc-product-price, .sc-badge-price-to-pay, .a-price .a-offscreen'
-                        )?.textContent) || null;
-                        // Quantity: a plain integer. Ignore the Subscribe & Save
-                        // frequency dropdown ("2 months (Most common)").
-                        const qtyRaw = clean(
-                            it.querySelector('.sc-quantity-textfield, input.sc-update-quantity, [data-action="a-stepper"] input')?.value
-                        );
-                        const qty = /^\\d+$/.test(qtyRaw) ? qtyRaw : '1';
-                        items.push({ asin, title, price, quantity: qty });
+            data = await page.evaluate(
+                """
+                () => {
+                    // Scope strictly to the active-cart container so we don't pick up
+                    // "Saved for later" rows or recommendation/"buy again" carousels.
+                    const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    // #activeCartViewForm reliably wraps ONLY the active line items
+                    // (not "saved for later" or recommendation carousels).
+                    const root =
+                        document.querySelector('#activeCartViewForm') ||
+                        document.querySelector('#sc-active-cart') ||
+                        document.querySelector('[data-name="Active Items"]');
+                    const items = [];
+                    if (root) {
+                        // Each line item is a .sc-list-item; its ASIN sits on the element
+                        // OR a descendant — don't require it on the element itself
+                        // (that was the bug that made this enumerate ~1 of N).
+                        root.querySelectorAll('.sc-list-item').forEach(it => {
+                            const title = clean(it.querySelector(
+                                '.sc-product-title, .a-truncate-cut, .sc-grid-item-product-title, [data-feature-id="item-title"]'
+                            )?.textContent);
+                            if (!title) return;
+                            const asin = it.getAttribute('data-asin')
+                                || it.querySelector('[data-asin]')?.getAttribute('data-asin')
+                                || null;
+                            const price = clean(it.querySelector(
+                                '.sc-product-price, .sc-badge-price-to-pay, .a-price .a-offscreen'
+                            )?.textContent) || null;
+                            // Quantity: a plain integer. Ignore the Subscribe & Save
+                            // frequency dropdown ("2 months (Most common)").
+                            const qtyRaw = clean(
+                                it.querySelector('.sc-quantity-textfield, input.sc-update-quantity, [data-action="a-stepper"] input')?.value
+                            );
+                            const qty = /^\\d+$/.test(qtyRaw) ? qtyRaw : '1';
+                            items.push({ asin, title, price, quantity: qty });
+                        });
+                    }
+                    // Dedupe by asin when present, else by title.
+                    const seen = new Set();
+                    const deduped = items.filter(i => {
+                        const k = i.asin || i.title;
+                        if (seen.has(k)) return false;
+                        seen.add(k);
+                        return true;
                     });
+                    // Active-cart subtotal (NOT the buybox element, which can be stale).
+                    const subtotal =
+                        clean(document.querySelector('#sc-subtotal-amount-activecart .sc-price')?.textContent) ||
+                        clean(document.querySelector('#sc-subtotal-amount-activecart')?.textContent) ||
+                        clean(document.querySelector('#sc-subtotal-amount-buybox .sc-price')?.textContent) ||
+                        null;
+                    const countText =
+                        clean(document.querySelector('#sc-subtotal-label-activecart, #sc-subtotal-label-buybox')?.textContent)
+                        || null;
+                    return { items: deduped, subtotal, countText };
                 }
-                // Dedupe by asin when present, else by title.
-                const seen = new Set();
-                const deduped = items.filter(i => {
-                    const k = i.asin || i.title;
-                    if (seen.has(k)) return false;
-                    seen.add(k);
-                    return true;
-                });
-                // Active-cart subtotal (NOT the buybox element, which can be stale).
-                const subtotal =
-                    clean(document.querySelector('#sc-subtotal-amount-activecart .sc-price')?.textContent) ||
-                    clean(document.querySelector('#sc-subtotal-amount-activecart')?.textContent) ||
-                    clean(document.querySelector('#sc-subtotal-amount-buybox .sc-price')?.textContent) ||
-                    null;
-                const countText =
-                    clean(document.querySelector('#sc-subtotal-label-activecart, #sc-subtotal-label-buybox')?.textContent)
-                    || null;
-                return { items: deduped, subtotal, countText };
-            }
-            """
-        )
-        data["item_count"] = len(data.get("items", []))
-        return json.dumps(data, indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+                """
+            )
+            data["item_count"] = len(data.get("items", []))
+            return json.dumps(data, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
@@ -1099,101 +1051,102 @@ async def amazon_place_order(
             amazon_list_payment_methods, or text like "Visa 1234".
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        # Cart -> proceed to checkout.
-        await page.goto(
-            f"https://www.amazon.{domain}/gp/cart/view.html",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            # Cart -> proceed to checkout.
+            await page.goto(
+                f"https://www.amazon.{domain}/gp/cart/view.html",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
 
-        ptc = None
-        for sel in (
-            'input[name="proceedToRetailCheckout"]',
-            "#sc-buy-box-ptc-button input",
-            "#sc-buy-box-ptc-button",
-            'a[href*="/gp/buy/spc"]',
-        ):
-            ptc = await page.query_selector(sel)
-            if ptc:
-                break
-        if not ptc:
+            ptc = None
+            for sel in (
+                'input[name="proceedToRetailCheckout"]',
+                "#sc-buy-box-ptc-button input",
+                "#sc-buy-box-ptc-button",
+                'a[href*="/gp/buy/spc"]',
+            ):
+                ptc = await page.query_selector(sel)
+                if ptc:
+                    break
+            if not ptc:
+                return json.dumps(
+                    {"error": "Couldn't find 'Proceed to checkout' — is the cart empty?"}
+                )
+            await ptc.click()
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(2000)
+
+            applied = await _apply_checkout_selections(page, address_hint, payment_hint)
+            summary = await _read_checkout_summary(page)
+            summary["selection_applied"] = applied
+
+            if not confirm:
+                summary["placed"] = False
+                summary["next_step"] = (
+                    "Review the above. To actually place this order, call amazon_place_order "
+                    "again with confirm=true (same address_hint / payment_hint)."
+                )
+                return json.dumps(summary, indent=2)
+
+            # confirm=True -> place the order.
+            place_btn = None
+            for sel in (
+                'input[name="placeYourOrder1"]',
+                "#placeYourOrder input",
+                "#submitOrderButtonId input",
+                "#bottomSubmitOrderButtonId input",
+                '#placeOrder input[type="submit"]',
+            ):
+                place_btn = await page.query_selector(sel)
+                if place_btn:
+                    break
+            if not place_btn:
+                summary["placed"] = False
+                summary["error"] = (
+                    "Reached checkout but couldn't find the 'Place your order' button "
+                    "(Amazon may want a missing address/payment/CVV, or changed its layout)."
+                )
+                return json.dumps(summary, indent=2)
+
+            await place_btn.click()
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(2500)
+
+            confirmation = await page.evaluate(
+                """
+                () => {
+                    const body = document.body.innerText || '';
+                    const placed = /(order placed|thank you|order confirmation|your order)/i.test(body);
+                    const m = body.match(/Order\\s*#?\\s*([0-9-]{10,})/i);
+                    return { placed, orderNumber: m ? m[1] : null };
+                }
+                """
+            )
             return json.dumps(
-                {"error": "Couldn't find 'Proceed to checkout' — is the cart empty?"}
+                {
+                    "placed": bool(confirmation.get("placed")),
+                    "order_number": confirmation.get("orderNumber"),
+                    "summary": summary,
+                    "message": "Order placed."
+                    if confirmation.get("placed")
+                    else "Clicked place-order but couldn't confirm success — check your Amazon orders page.",
+                },
+                indent=2,
             )
-        await ptc.click()
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(2000)
-
-        applied = await _apply_checkout_selections(page, address_hint, payment_hint)
-        summary = await _read_checkout_summary(page)
-        summary["selection_applied"] = applied
-
-        if not confirm:
-            summary["placed"] = False
-            summary["next_step"] = (
-                "Review the above. To actually place this order, call amazon_place_order "
-                "again with confirm=true (same address_hint / payment_hint)."
-            )
-            return json.dumps(summary, indent=2)
-
-        # confirm=True -> place the order.
-        place_btn = None
-        for sel in (
-            'input[name="placeYourOrder1"]',
-            "#placeYourOrder input",
-            "#submitOrderButtonId input",
-            "#bottomSubmitOrderButtonId input",
-            '#placeOrder input[type="submit"]',
-        ):
-            place_btn = await page.query_selector(sel)
-            if place_btn:
-                break
-        if not place_btn:
-            summary["placed"] = False
-            summary["error"] = (
-                "Reached checkout but couldn't find the 'Place your order' button "
-                "(Amazon may want a missing address/payment/CVV, or changed its layout)."
-            )
-            return json.dumps(summary, indent=2)
-
-        await place_btn.click()
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(2500)
-
-        confirmation = await page.evaluate(
-            """
-            () => {
-                const body = document.body.innerText || '';
-                const placed = /(order placed|thank you|order confirmation|your order)/i.test(body);
-                const m = body.match(/Order\\s*#?\\s*([0-9-]{10,})/i);
-                return { placed, orderNumber: m ? m[1] : null };
-            }
-            """
-        )
-        return json.dumps(
-            {
-                "placed": bool(confirmation.get("placed")),
-                "order_number": confirmation.get("orderNumber"),
-                "summary": summary,
-                "message": "Order placed."
-                if confirmation.get("placed")
-                else "Clicked place-order but couldn't confirm success — check your Amazon orders page.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 async def _apply_checkout_selections(
@@ -1352,81 +1305,217 @@ async def _read_checkout_summary(page: Page) -> dict:
 
 
 @mcp.tool()
-async def amazon_list_orders(max_orders: int = 10, domain: str = DEFAULT_DOMAIN) -> str:
-    """List your recent Amazon orders.
+async def amazon_list_orders(
+    max_orders: int = 10,
+    year: int | None = None,
+    continuation: str | None = None,
+    domain: str = DEFAULT_DOMAIN,
+) -> OrderListResult:
+    """List your recent Amazon orders with optional year filter and pagination continuation.
 
-    Returns each order's number, date, total, items, delivery status, and whether
-    it currently shows a "Return or replace items" option. Requires being logged in.
+    Returns lightly structured Amazon order summaries including order number, source URL,
+    visible card text, and labeled links. Has a 5-page budget and returns stop_reason and continuation.
+
+    After more than five order reads in 20 minutes, this call waits before loading,
+    and every 15th read waits about one and a half to two and a half minutes.
 
     Args:
-        max_orders: How many recent orders to return (default 10).
+        max_orders: Maximum number of orders to return across pages (default 10).
+        year: Optional calendar year to filter by (e.g. 2024). Opens the year URL
+            advertised by the live order-history filter.
+        continuation: Optional continuation token/URL from a prior list_orders call.
+        domain: Amazon domain suffix — "ca" for Canada, "com" for US.
+    """
+    if isinstance(max_orders, bool) or not isinstance(max_orders, int) or max_orders < 1:
+        raise ToolError("max_orders must be a positive integer.")
+
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            start_url = f"https://www.amazon.{domain}/gp/css/order-history"
+            return await collect_orders(
+                page=page,
+                start_url=start_url,
+                max_orders=max_orders,
+                check_captcha_fn=check_captcha,
+                account_name_fn=_account_name,
+                is_logged_in_fn=_is_logged_in,
+                year=year,
+                continuation=continuation,
+                max_pages=5,
+            )
+        finally:
+            await page.close()
+
+
+@mcp.tool()
+async def amazon_search_orders(
+    query: str,
+    max_orders: int = 10,
+    domain: str = DEFAULT_DOMAIN,
+) -> OrderListResult:
+    """Search your past Amazon orders by keyword using Amazon's order search form.
+
+    Returns lightly structured order summaries. Has a 5-page budget and returns stop_reason.
+
+    After more than five order reads in 20 minutes, this call waits before loading,
+    and every 15th read waits about one and a half to two and a half minutes.
+
+    Args:
+        query: Search keywords (e.g. "keyboard", "logitech", or an item name).
+        max_orders: Maximum number of matching orders to return (default 10).
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/gp/css/order-history",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
-        await page.wait_for_timeout(1500)
+    query = (query or "").strip()
+    if not query:
+        raise ToolError("query must not be empty.")
+    if isinstance(max_orders, bool) or not isinstance(max_orders, int) or max_orders < 1:
+        raise ToolError("max_orders must be a positive integer.")
 
-        orders = await page.evaluate(
-            """
-            (maxOrders) => {
-                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                const cards = [...document.querySelectorAll(
-                    '.order-card, .js-order-card, [class*="order-card"]'
-                )];
-                const out = [];
-                for (const c of cards.slice(0, maxOrders)) {
-                    const full = clean(c.textContent);
-                    const num = (c.querySelector('.yohtmlc-order-id')?.textContent || full)
-                        .match(/(D?\\d{2,3}-\\d{7}-\\d{7})/);
-                    // Header columns: order placed date + total are in the top bar.
-                    const header = clean(
-                        c.querySelector('.order-header, [class*="order-header"], .a-box-group .a-box:first-child')
-                            ?.textContent
-                    );
-                    const date = (header.match(
-                        /([0-9]{1,2}\\s+[A-Z][a-z]+\\s+[0-9]{4}|[A-Z][a-z]+\\s+[0-9]{1,2},?\\s+[0-9]{4})/
-                    ) || [])[0] || null;
-                    const total = (header.match(/(?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2}/) || [])[0] || null;
-                    const titles = [...c.querySelectorAll(
-                        '.yohtmlc-product-title, .a-link-normal[href*="/product/"], [class*="product-title"]'
-                    )].map(e => clean(e.textContent)).filter(Boolean).slice(0, 5);
-                    const status = clean(
-                        c.querySelector('.delivery-box .a-text-bold, [class*="delivery"] .a-text-bold, .delivery-box')
-                            ?.textContent
-                    ).split(/(?=[A-Z][a-z])/)[0] || null;
-                    const returnable = [...c.querySelectorAll('a')].some(
-                        a => /return or replace|return item|replace item/i.test(a.textContent || '')
-                    );
-                    out.push({
-                        order_number: num ? num[1] : null,
-                        date, total,
-                        items: titles,
-                        status: status || null,
-                        returnable,
-                    });
-                }
-                return out;
-            }
-            """,
-            max_orders,
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            search_url = f"https://www.amazon.{domain}/your-orders/orders?search={quote_plus(query)}"
+            return await collect_orders(
+                page=page,
+                start_url=search_url,
+                max_orders=max_orders,
+                check_captcha_fn=check_captcha,
+                account_name_fn=_account_name,
+                is_logged_in_fn=_is_logged_in,
+                max_pages=5,
+            )
+        finally:
+            await page.close()
+
+
+@mcp.tool()
+async def amazon_get_order(
+    order_number: str,
+    domain: str = DEFAULT_DOMAIN,
+) -> OrderDetailsResult:
+    """Fetch direct details and visible card text for a specific Amazon order.
+
+    After more than five order reads in 20 minutes, this call waits before loading,
+    and every 15th read waits about one and a half to two and a half minutes.
+
+    Args:
+        order_number: Amazon order number (e.g. "112-1234567-1234567").
+        domain: Amazon domain — "ca" for Canada, "com" for US.
+    """
+    order_number = order_number.strip()
+    if not ORDER_NUMBER_RE.fullmatch(order_number):
+        raise ToolError(
+            f"Invalid Amazon order number '{order_number}'. Expected format like '112-1234567-1234567'."
         )
-        return json.dumps({"count": len(orders), "orders": orders}, indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            return await fetch_order_details(
+                page=page,
+                order_number=order_number,
+                domain=domain,
+                check_captcha_fn=check_captcha,
+                account_name_fn=_account_name,
+                is_logged_in_fn=_is_logged_in,
+            )
+        finally:
+            await page.close()
+
+
+@mcp.tool()
+async def amazon_get_order_document(
+    order_number: str,
+    domain: str = DEFAULT_DOMAIN,
+) -> OrderDocumentResult:
+    """Extract visible content, heading, and structured HSA/FSA eligibility from an order's printable document.
+
+    Returns the displayed document text, labeled links, document heading, and parsed
+    HSA/FSA eligibility details (`hsa_fsa`) when present on the document.
+
+    After more than five order reads in 20 minutes, this call waits before loading,
+    and every 15th read waits about one and a half to two and a half minutes.
+
+    Args:
+        order_number: Amazon order number (e.g. "112-1234567-1234567").
+        domain: Amazon domain — "ca" for Canada, "com" for US.
+    """
+    order_number = order_number.strip()
+    if not ORDER_NUMBER_RE.fullmatch(order_number):
+        raise ToolError(
+            f"Invalid Amazon order number '{order_number}'. Expected format like '112-1234567-1234567'."
+        )
+
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            return await fetch_order_document(
+                page=page,
+                order_number=order_number,
+                domain=domain,
+                check_captcha_fn=check_captcha,
+            )
+        finally:
+            await page.close()
+
+
+@mcp.tool()
+async def amazon_download_invoice(
+    order_number: str,
+    output_format: str = "html",
+    domain: str = DEFAULT_DOMAIN,
+) -> DownloadInvoiceResult:
+    """Download the printable order summary or invoice as HTML (default) or PDF.
+
+    Saves the captured page to AMAZON_INVOICE_DIR with private permissions (0o600).
+    PDF rendering is supported on Chromium/Playwright; Camoufox currently returns
+    an explicit unsupported format error.
+
+    After more than five order reads in 20 minutes, this call waits before loading,
+    and every 15th read waits about one and a half to two and a half minutes.
+
+    Args:
+        order_number: Amazon order number (e.g. "112-1234567-1234567").
+        output_format: Document format — "html" (default) or "pdf".
+        domain: Amazon domain — "ca" for Canada, "com" for US.
+    """
+    order_number = order_number.strip()
+    if not ORDER_NUMBER_RE.fullmatch(order_number):
+        raise ToolError(
+            f"Invalid Amazon order number '{order_number}'. Expected format like '112-1234567-1234567'."
+        )
+
+    output_format = output_format.strip().lower()
+    if output_format not in {"html", "pdf"}:
+        raise ToolError(f"Invalid output_format '{output_format}'. Must be 'html' or 'pdf'.")
+
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            return await download_order_invoice(
+                page=page,
+                order_number=order_number,
+                output_format=output_format,
+                domain=domain,
+                invoice_dir=INVOICE_DIR,
+                check_captcha_fn=check_captcha,
+            )
+        finally:
+            await page.close()
+
+
+@mcp.tool()
+async def amazon_reset_session() -> ResetSessionResult:
+    """Close this server's owned browser instances while preserving saved authentication on disk."""
+    # reset_session takes authenticated_lock. asyncio.Lock is not reentrant.
+    res = await reset_session()
+    return ResetSessionResult(**res)
 
 
 @mcp.tool()
@@ -1442,81 +1531,82 @@ async def amazon_view_returns(domain: str = DEFAULT_DOMAIN) -> str:
     Args:
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        # Started/processing returns live on the returns-filtered order history,
-        # not the (often empty) /spr or Return Center pages.
-        await page.goto(
-            f"https://www.amazon.{domain}/gp/your-account/order-history?orderFilter=returns",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
-        await page.wait_for_timeout(2500)
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            # Started/processing returns live on the returns-filtered order history,
+            # not the (often empty) /spr or Return Center pages.
+            await page.goto(
+                f"https://www.amazon.{domain}/gp/your-account/order-history?orderFilter=returns",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
+            await page.wait_for_timeout(2500)
 
-        returns = await page.evaluate(
-            """
-            () => {
-                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                const cards = [...document.querySelectorAll(
-                    '.order-card, .js-order-card, [class*="order-card"]'
-                )];
-                const out = [];
-                for (const c of cards) {
-                    const full = clean(c.textContent);
-                    // Short status line (e.g. "Return started", "Refund issued").
-                    const bolds = [...c.querySelectorAll('.a-text-bold')]
-                        .map(e => clean(e.textContent))
-                        .filter(Boolean);
-                    const status = bolds
-                        .filter(t => t.length < 40 &&
-                            /return|refund|received|in transit|drop ?off|processed|completed/i.test(t))
-                        .sort((a, b) => a.length - b.length)[0] || null;
-                    // Only keep cards that are actually returns/refunds.
-                    const isReturn = !!status || /return started|refund (?:issued|of)|return (?:received|requested)/i.test(full);
-                    if (!isReturn) continue;
+            returns = await page.evaluate(
+                """
+                () => {
+                    const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    const cards = [...document.querySelectorAll(
+                        '.order-card, .js-order-card, [class*="order-card"]'
+                    )];
+                    const out = [];
+                    for (const c of cards) {
+                        const full = clean(c.textContent);
+                        // Short status line (e.g. "Return started", "Refund issued").
+                        const bolds = [...c.querySelectorAll('.a-text-bold')]
+                            .map(e => clean(e.textContent))
+                            .filter(Boolean);
+                        const status = bolds
+                            .filter(t => t.length < 40 &&
+                                /return|refund|received|in transit|drop ?off|processed|completed/i.test(t))
+                            .sort((a, b) => a.length - b.length)[0] || null;
+                        // Only keep cards that are actually returns/refunds.
+                        const isReturn = !!status || /return started|refund (?:issued|of)|return (?:received|requested)/i.test(full);
+                        if (!isReturn) continue;
 
-                    const num = (full.match(/(D?\\d{2,3}-\\d{7}-\\d{7})/) || [])[1] || null;
-                    const title = clean(
-                        c.querySelector('.yohtmlc-product-title, .a-link-normal[href*="/product/"]')?.textContent
-                    ).slice(0, 80) || null;
-                    const refund = (full.match(/refund of\\s+((?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2})/i) || [])[1] || null;
-                    const canTrack = /view return\\/refund status|view return label/i.test(full);
+                        const num = (full.match(/(D?\\d{2,3}-\\d{7}-\\d{7})/) || [])[1] || null;
+                        const title = clean(
+                            c.querySelector('.yohtmlc-product-title, .a-link-normal[href*="/product/"]')?.textContent
+                        ).slice(0, 80) || null;
+                        const refund = (full.match(/refund of\\s+((?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2})/i) || [])[1] || null;
+                        const canTrack = /view return\\/refund status|view return label/i.test(full);
 
-                    out.push({
-                        order_number: num,
-                        item: title,
-                        status: status || "Return in progress",
-                        refund: refund,
-                        refund_note: refund ? null : "amount shown after Amazon receives the item",
-                        details_available: canTrack,
-                    });
+                        out.push({
+                            order_number: num,
+                            item: title,
+                            status: status || "Return in progress",
+                            refund: refund,
+                            refund_note: refund ? null : "amount shown after Amazon receives the item",
+                            details_available: canTrack,
+                        });
+                    }
+                    return out;
                 }
-                return out;
-            }
-            """
-        )
-        return json.dumps(
-            {
-                "count": len(returns),
-                "returns": returns,
-                "note": "No returns found."
-                if not returns
-                else "Refund amount / return-by date / drop-off location live behind each "
-                "return's 'View Return/Refund Status' page — not shown in this summary.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+                """
+            )
+            return json.dumps(
+                {
+                    "count": len(returns),
+                    "returns": returns,
+                    "note": "No returns found."
+                    if not returns
+                    else "Refund amount / return-by date / drop-off location live behind each "
+                    "return's 'View Return/Refund Status' page — not shown in this summary.",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
@@ -1544,113 +1634,114 @@ async def amazon_start_return(
         reason: Return reason text to match against the dropdown (e.g. "no longer needed").
         domain: Amazon domain — "ca" for Canada, "com" for US.
     """
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(
-            f"https://www.amazon.{domain}/gp/css/order-history",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
-        await page.wait_for_timeout(1500)
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                f"https://www.amazon.{domain}/gp/css/order-history",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
+            await page.wait_for_timeout(1500)
 
-        # Find the "Return or replace items" link on the matching order card.
-        link = await page.evaluate(
-            """
-            (orderNum) => {
-                const cards = [...document.querySelectorAll(
-                    '.order-card, .js-order-card, [class*="order-card"]'
-                )];
-                for (const c of cards) {
-                    if (!(c.textContent || '').includes(orderNum)) continue;
-                    const a = [...c.querySelectorAll('a')].find(
-                        x => /return or replace|return item|replace item/i.test(x.textContent || '')
+            # Find the "Return or replace items" link on the matching order card.
+            link = await page.evaluate(
+                """
+                (orderNum) => {
+                    const cards = [...document.querySelectorAll(
+                        '.order-card, .js-order-card, [class*="order-card"]'
+                    )];
+                    for (const c of cards) {
+                        if (!(c.textContent || '').includes(orderNum)) continue;
+                        const a = [...c.querySelectorAll('a')].find(
+                            x => /return or replace|return item|replace item/i.test(x.textContent || '')
+                        );
+                        return a ? a.href : 'NO_RETURN_LINK';
+                    }
+                    return 'ORDER_NOT_FOUND';
+                }
+                """,
+                order_number,
+            )
+            if link == "ORDER_NOT_FOUND":
+                return json.dumps(
+                    {"error": f"Order {order_number} not found in recent history."}
+                )
+            if link == "NO_RETURN_LINK":
+                return json.dumps(
+                    {
+                        "error": f"Order {order_number} has no return option right now "
+                        "(not delivered yet, outside the return window, or non-returnable).",
+                        "returnable": False,
+                    }
+                )
+
+            await page.goto(link, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2500)
+
+            found = await page.evaluate(
+                """
+                () => {
+                    const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    // The return-reason control is a native <select> whose id ends in
+                    // "questionnaire-widget-native-dropdown" (NOT the site search dropdown).
+                    const reasonSel = document.querySelector(
+                        'select[id*="questionnaire"], select.a-native-dropdown[id*="native-dropdown"]'
                     );
-                    return a ? a.href : 'NO_RETURN_LINK';
+                    const reasons = reasonSel
+                        ? [...reasonSel.querySelectorAll('option')]
+                            .map(o => clean(o.textContent))
+                            .filter(t => t && !/choose a response/i.test(t))
+                        : [];
+                    // Item being returned: capture the descriptor lines (size/colour/sold by).
+                    const itemBlock = clean(
+                        (document.querySelector(
+                            '[class*="return-item"], [class*="ReturnItem"], [class*="item-info"], .a-fixed-left-grid'
+                        ) || {}).textContent
+                    );
+                    const refund = (document.body.innerText.match(/(?:refund[^$]*?)((?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2})/i) || [])[1] || null;
+                    return {
+                        item: itemBlock ? itemBlock.slice(0, 200) : null,
+                        reason_options: reasons,
+                        refund_estimate: refund,
+                    };
                 }
-                return 'ORDER_NOT_FOUND';
-            }
-            """,
-            order_number,
-        )
-        if link == "ORDER_NOT_FOUND":
-            return json.dumps(
-                {"error": f"Order {order_number} not found in recent history."}
-            )
-        if link == "NO_RETURN_LINK":
-            return json.dumps(
-                {
-                    "error": f"Order {order_number} has no return option right now "
-                    "(not delivered yet, outside the return window, or non-returnable).",
-                    "returnable": False,
-                }
+                """
             )
 
-        await page.goto(link, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2500)
+            if not confirm:
+                return json.dumps(
+                    {
+                        "placed": False,
+                        "order_number": order_number,
+                        "return_wizard_url": page.url,
+                        "returning_item": found.get("item"),
+                        "reason_options": found.get("reason_options"),
+                        "refund_estimate": found.get("refund_estimate"),
+                        "next_step": "Preview only. The full multi-step submit (reason → method → "
+                        "drop-off → confirm) is unverified; we should walk it live against this "
+                        "real return before trusting confirm=true.",
+                    },
+                    indent=2,
+                )
 
-        found = await page.evaluate(
-            """
-            () => {
-                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                // The return-reason control is a native <select> whose id ends in
-                // "questionnaire-widget-native-dropdown" (NOT the site search dropdown).
-                const reasonSel = document.querySelector(
-                    'select[id*="questionnaire"], select.a-native-dropdown[id*="native-dropdown"]'
-                );
-                const reasons = reasonSel
-                    ? [...reasonSel.querySelectorAll('option')]
-                        .map(o => clean(o.textContent))
-                        .filter(t => t && !/choose a response/i.test(t))
-                    : [];
-                // Item being returned: capture the descriptor lines (size/colour/sold by).
-                const itemBlock = clean(
-                    (document.querySelector(
-                        '[class*="return-item"], [class*="ReturnItem"], [class*="item-info"], .a-fixed-left-grid'
-                    ) || {}).textContent
-                );
-                const refund = (document.body.innerText.match(/(?:refund[^$]*?)((?:CDN\\$|\\$|US\\$)\\s?[0-9,]+\\.[0-9]{2})/i) || [])[1] || null;
-                return {
-                    item: itemBlock ? itemBlock.slice(0, 200) : null,
-                    reason_options: reasons,
-                    refund_estimate: refund,
-                };
-            }
-            """
-        )
-
-        if not confirm:
             return json.dumps(
                 {
                     "placed": False,
-                    "order_number": order_number,
-                    "return_wizard_url": page.url,
-                    "returning_item": found.get("item"),
-                    "reason_options": found.get("reason_options"),
-                    "refund_estimate": found.get("refund_estimate"),
-                    "next_step": "Preview only. The full multi-step submit (reason → method → "
-                    "drop-off → confirm) is unverified; we should walk it live against this "
-                    "real return before trusting confirm=true.",
+                    "error": "Submit path is intentionally not wired blind. Run this preview "
+                    "live with the item in hand so we can reverse-engineer the reason/method/"
+                    "drop-off steps safely, like we did for checkout.",
                 },
                 indent=2,
             )
-
-        return json.dumps(
-            {
-                "placed": False,
-                "error": "Submit path is intentionally not wired blind. Run this preview "
-                "live with the item in hand so we can reverse-engineer the reason/method/"
-                "drop-off steps safely, like we did for checkout.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        await page.close()
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            await page.close()
 
 
 @mcp.tool()
@@ -1685,121 +1776,122 @@ async def amazon_subscribe(
     if not url:
         url = f"https://www.amazon.{domain}/dp/{asin}"
 
-    ctx = await get_logged_in_context()
-    page = await ctx.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        captcha = await check_captcha(page)
-        if captcha:
-            return json.dumps({"error": captcha})
-        name = await _account_name(page)
-        if not _is_logged_in(name):
-            return json.dumps({"error": "Not logged in. Run amazon_login first."})
+    async with authenticated_lock():
+        ctx = await get_logged_in_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            captcha = await check_captcha(page)
+            if captcha:
+                return json.dumps({"error": captcha})
+            name = await _account_name(page)
+            if not _is_logged_in(name):
+                return json.dumps({"error": "Not logged in. Run amazon_login first."})
 
-        title_el = await page.query_selector("#productTitle")
-        title = (await title_el.inner_text()).strip() if title_el else None
+            title_el = await page.query_selector("#productTitle")
+            title = (await title_el.inner_text()).strip() if title_el else None
 
-        # Expand the "Subscribe & Save" accordion so its controls render.
-        await page.evaluate(
-            """
-            () => {
-                const rows = [...document.querySelectorAll(
-                    '.a-accordion-row, [id*="ccordionRow"], .a-box'
-                )];
-                for (const r of rows) {
-                    if (/subscribe & save|subscribe and save/i.test(r.textContent || '')) {
-                        (r.querySelector('a, input[type=radio], [role=button]') || r).click();
-                        return;
+            # Expand the "Subscribe & Save" accordion so its controls render.
+            await page.evaluate(
+                """
+                () => {
+                    const rows = [...document.querySelectorAll(
+                        '.a-accordion-row, [id*="ccordionRow"], .a-box'
+                    )];
+                    for (const r of rows) {
+                        if (/subscribe & save|subscribe and save/i.test(r.textContent || '')) {
+                            (r.querySelector('a, input[type=radio], [role=button]') || r).click();
+                            return;
+                        }
                     }
                 }
-            }
-            """
-        )
-        await page.wait_for_timeout(2000)
+                """
+            )
+            await page.wait_for_timeout(2000)
 
-        sub_btn = await page.query_selector("#rcx-subscribe-submit-button")
-        if not sub_btn:
+            sub_btn = await page.query_selector("#rcx-subscribe-submit-button")
+            if not sub_btn:
+                return json.dumps(
+                    {
+                        "error": "This item isn't offering Subscribe & Save right now "
+                        "(not S&S-eligible, or no active subscription offer).",
+                        "subscribable": False,
+                        "url": url,
+                    }
+                )
+
+            # Best-effort frequency selection (Amazon's default is used if this misses).
+            freq_applied = "default"
+            if frequency:
+                try:
+                    fl = frequency.lower()
+                    sels = await page.query_selector_all("select")
+                    for sel in sels:
+                        opts = await sel.query_selector_all("option")
+                        for o in opts:
+                            if fl in ((await o.inner_text()) or "").lower():
+                                await sel.select_option(value=await o.get_attribute("value"))
+                                freq_applied = frequency
+                                break
+                        if freq_applied != "default":
+                            break
+                except Exception:
+                    freq_applied = "default (couldn't set requested frequency)"
+
+            preview = await page.evaluate(
+                """
+                () => {
+                    const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    // Discount % and cadence render in the text around the subscribe button.
+                    const btn = document.querySelector('#rcx-subscribe-submit-button');
+                    let scope = btn;
+                    for (let i = 0; i < 6 && scope; i++) scope = scope.parentElement;
+                    const txt = clean((scope || document).textContent);
+                    const discount = (txt.match(/save (?:up to )?\\d+%|\\d+% off/i) || [])[0] || null;
+                    const freq = (txt.match(/(?:deliver every|every)\\s*[\\w ]{0,18}(?:week|month)s?/i) || [])[0] || null;
+                    // Base price from the main buy-box (S&S = base minus the discount).
+                    const price = clean((document.querySelector(
+                        '#corePriceDisplay_desktop_feature_div .a-offscreen, #corePrice_feature_div .a-offscreen, .a-price .a-offscreen'
+                    ) || {}).textContent) || null;
+                    return { base_price: price, discount, frequency: freq };
+                }
+                """
+            )
+            preview["title"] = title
+            preview["frequency_requested"] = freq_applied
+
+            if not confirm:
+                preview["subscribed"] = False
+                preview["next_step"] = (
+                    "Preview only — no subscription created. To actually subscribe "
+                    "(recurring charge), call amazon_subscribe again with confirm=true."
+                )
+                return json.dumps(preview, indent=2)
+
+            await sub_btn.click()
+            await page.wait_for_timeout(2500)
+            ok = await page.evaluate(
+                """
+                () => /subscription|subscribed|you'll receive|first delivery|manage your subscriptions/i
+                    .test(document.body.innerText || '')
+                """
+            )
             return json.dumps(
                 {
-                    "error": "This item isn't offering Subscribe & Save right now "
-                    "(not S&S-eligible, or no active subscription offer).",
-                    "subscribable": False,
-                    "url": url,
-                }
+                    "subscribed": bool(ok),
+                    "title": title,
+                    "frequency": preview.get("frequency"),
+                    "base_price": preview.get("base_price"),
+                    "message": "Subscription created."
+                    if ok
+                    else "Clicked subscribe but couldn't confirm — check Your Subscribe & Save Items.",
+                },
+                indent=2,
             )
-
-        # Best-effort frequency selection (Amazon's default is used if this misses).
-        freq_applied = "default"
-        if frequency:
-            try:
-                fl = frequency.lower()
-                sels = await page.query_selector_all("select")
-                for sel in sels:
-                    opts = await sel.query_selector_all("option")
-                    for o in opts:
-                        if fl in ((await o.inner_text()) or "").lower():
-                            await sel.select_option(value=await o.get_attribute("value"))
-                            freq_applied = frequency
-                            break
-                    if freq_applied != "default":
-                        break
-            except Exception:
-                freq_applied = "default (couldn't set requested frequency)"
-
-        preview = await page.evaluate(
-            """
-            () => {
-                const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                // Discount % and cadence render in the text around the subscribe button.
-                const btn = document.querySelector('#rcx-subscribe-submit-button');
-                let scope = btn;
-                for (let i = 0; i < 6 && scope; i++) scope = scope.parentElement;
-                const txt = clean((scope || document).textContent);
-                const discount = (txt.match(/save (?:up to )?\\d+%|\\d+% off/i) || [])[0] || null;
-                const freq = (txt.match(/(?:deliver every|every)\\s*[\\w ]{0,18}(?:week|month)s?/i) || [])[0] || null;
-                // Base price from the main buy-box (S&S = base minus the discount).
-                const price = clean((document.querySelector(
-                    '#corePriceDisplay_desktop_feature_div .a-offscreen, #corePrice_feature_div .a-offscreen, .a-price .a-offscreen'
-                ) || {}).textContent) || null;
-                return { base_price: price, discount, frequency: freq };
-            }
-            """
-        )
-        preview["title"] = title
-        preview["frequency_requested"] = freq_applied
-
-        if not confirm:
-            preview["subscribed"] = False
-            preview["next_step"] = (
-                "Preview only — no subscription created. To actually subscribe "
-                "(recurring charge), call amazon_subscribe again with confirm=true."
-            )
-            return json.dumps(preview, indent=2)
-
-        await sub_btn.click()
-        await page.wait_for_timeout(2500)
-        ok = await page.evaluate(
-            """
-            () => /subscription|subscribed|you'll receive|first delivery|manage your subscriptions/i
-                .test(document.body.innerText || '')
-            """
-        )
-        return json.dumps(
-            {
-                "subscribed": bool(ok),
-                "title": title,
-                "frequency": preview.get("frequency"),
-                "base_price": preview.get("base_price"),
-                "message": "Subscription created."
-                if ok
-                else "Clicked subscribe but couldn't confirm — check Your Subscribe & Save Items.",
-            },
-            indent=2,
-        )
-    except Exception as e:
-        return json.dumps({"error": str(e), "url": url})
-    finally:
-        await page.close()
+        except Exception as e:
+            return json.dumps({"error": str(e), "url": url})
+        finally:
+            await page.close()
 
 
 def main():
